@@ -1,0 +1,4 @@
+node_modules/
+.env
+break-bot-key.json
+data/

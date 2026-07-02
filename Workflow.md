@@ -166,8 +166,8 @@ Violations are tracked in the break history and shown on the Tab5 dashboard.
 
 ## VPS Deployment
 
-| Parameter | Value |
-|-----------|-------|
+| Parameter | Current Value |
+|-----------|:-------------:|
 | Server | `164.132.45.47` (OVH VPS) |
 | PM2 name | `break-bot-server` |
 | Port | `3004` |
@@ -175,6 +175,109 @@ Violations are tracked in the break history and shown on the Tab5 dashboard.
 | Startup | `node src/server.js` |
 | Proxy | Caddy (vps-faf8418b.vps.ovh.net → localhost:3004) |
 | Git | `github.com/PJ-automate/break-bot-server` (branch: master) |
+
+---
+
+## Fresh Setup Guide (New PC / New Server)
+
+Use this section when deploying the break bot on a brand new machine.
+
+### Prerequisites
+- **Node.js** v18 or higher
+- **npm** (comes with Node.js)
+- **Git**
+- **PM2** (`npm install -g pm2`)
+- **Caddy** (optional, for reverse proxy)
+
+### Step 1: Clone the Repository
+```bash
+git clone https://github.com/PJ-automate/break-bot-server.git
+cd break-bot-server
+npm install
+```
+
+### Step 2: Configure Environment
+```bash
+# Create .env file (copy from template or use values below)
+cat > .env << 'EOF'
+BREAK_BOT_TOKEN=8712015323:AAGIobbwUZ2PDJ_xXeVG6XGawH8Eume_EMk
+BREAK_SHEET_ID=1-ZRcIVmMwXzTjGri0eE0off4jWDhppV6Gs-k7_tRop8
+BREAK_GROUP_ID=-1003716788529
+BREAK_SERVICE_ACCOUNT_PATH=./break-bot-key.json
+BREAK_SERVER_PORT=3004
+BREAK_SERVER_HOST=0.0.0.0
+EOF
+```
+
+### Step 3: Google Service Account Setup
+1. Go to https://console.cloud.google.com/
+2. Select or create a project
+3. Go to **IAM & Admin → Service Accounts**
+4. Create a service account (or use existing)
+5. Generate a JSON key → download as `break-bot-key.json`
+6. Place the key file in the project root (`break-bot-server/break-bot-key.json`)
+7. Share the Google Sheet **"CS-Break Tracker"** with the service account email (Editor access)
+
+### Step 4: Start the Server
+```bash
+# Test run
+node src/server.js
+
+# If working, start with PM2 (persistent)
+pm2 start src/server.js --name break-bot-server
+pm2 save
+pm2 startup   # Follow the instructions to enable auto-start on boot
+```
+
+### Step 5: Configure Telegram Webhook
+```bash
+# If using Caddy proxy:
+curl "http://localhost:3004/set-break-webhook?url=https://YOUR-DOMAIN/webhook-break"
+
+# Or direct (no proxy):
+curl "http://localhost:3004/set-break-webhook?url=https://YOUR-SERVER-IP:3004/webhook-break"
+```
+
+### Step 6: (Optional) Caddy Reverse Proxy
+If you want a custom domain instead of IP:port:
+
+**Caddyfile:**
+```
+your-domain.com {
+    handle /webhook-break* {
+        reverse_proxy localhost:3004
+    }
+    handle /api/break-tracker* {
+        reverse_proxy localhost:3004
+    }
+    handle /api/breaks/dashboard* {
+        reverse_proxy localhost:3004
+    }
+}
+```
+
+### Step 7: Integrate with Project2 Dashboard
+In `Project2-Agent Activity Automate/src/dashboard_server.js`, update:
+
+```javascript
+var BREAK_API_URL = 'http://localhost:3004/api/breaks/dashboard';
+```
+
+The Tab5 HTML (`tab5-cs-break-tracker/index.html`) fetches from `/api/break-tracker`
+which is proxied through the dashboard server using the URL above.
+
+### Step 8: Verify Everything
+```bash
+# Check health
+curl http://localhost:3004/health
+
+# Check PM2
+pm2 list
+pm2 logs break-bot-server
+
+# Test bot
+# Send /help to @CSBreakMonitoring_bot in Telegram
+```
 
 ---
 

@@ -6,6 +6,20 @@ CS Break Tracker is a Telegram bot (@CSBreakMonitoring_bot) that allows customer
 
 ---
 
+## Prerequisites (For New Setup)
+
+| Requirement | Version / Details |
+|-------------|:-----------------:|
+| Node.js | >= 18.0.0 |
+| npm | Comes with Node.js |
+| Git | Any recent version |
+| PM2 | `npm install -g pm2` |
+| Google Service Account | JSON key with Google Sheets API access |
+| Telegram Bot Token | From @BotFather on Telegram |
+| Google Sheet ID | Shared with service account email (Editor) |
+
+---
+
 ## Telegram Bot Commands
 
 ### Agent Commands
@@ -155,11 +169,20 @@ pm2 start src/server.js --name break-bot-server
 # Restart bot
 pm2 restart break-bot-server
 
+# Stop bot
+pm2 stop break-bot-server
+
 # View logs
 pm2 logs break-bot-server
 
-# Monitor
+# Monitor (real-time dashboard)
 pm2 monit
+
+# Save PM2 process list (so it restarts on reboot)
+pm2 save
+
+# Enable PM2 startup script (run once, follow instructions)
+pm2 startup
 
 # Update from GitHub
 cd /home/ubuntu/break-bot-server
@@ -167,11 +190,21 @@ git pull origin master
 pm2 restart break-bot-server
 ```
 
+### Firewall / Port Access
+- **Port 3004** must be accessible if not using a reverse proxy
+- If using Caddy, only ports **80 (HTTP)** and **443 (HTTPS)** need to be open
+- For local-only (same machine as Project2), `localhost:3004` is sufficient
+- VPS firewall: `sudo ufw allow 3004` (if direct access needed)
+
 ### Set Webhook
 
 ```bash
 # After deploying to new server, configure Telegram webhook:
-curl "http://localhost:3004/set-break-webhook?url=https://vps-faf8418b.vps.ovh.net/webhook-break"
+# (replace YOUR-DOMAIN with your actual domain or IP)
+curl "http://localhost:3004/set-break-webhook?url=https://YOUR-DOMAIN/webhook-break"
+
+# Example with IP directly:
+curl "http://localhost:3004/set-break-webhook?url=http://YOUR-SERVER-IP:3004/webhook-break"
 ```
 
 ---

@@ -23,6 +23,9 @@ var BREAK_SHEETS_READY = false;
 // Updated on each endBreak; read from DAILY SUMMARY on first call per day.
 var totalUsedCache = new Map();
 
+// Cache TTL for sheet data (15 seconds)
+const DATA_CACHE_TTL = 15000;
+
 function getTotalUsedCacheKey(userId, bd, shiftType, shiftPeriod) {
   return String(userId) + '_' + bd + '_' + shiftType + '_' + shiftPeriod;
 }
@@ -1105,5 +1108,6 @@ module.exports = {
   getDashboardData,
   archiveOldData,
   startBreak,
-  endBreak
+  endBreak,
+  updateDailySummary
 };

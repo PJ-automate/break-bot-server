@@ -9,6 +9,49 @@
 
 const CONFIG = require('./config');
 const { readRange, getOrCreateSheet, updateRange, breakBatchUpdate, formatBreakSheets } = require('./google');
+const { google } = require("googleapis");
+const key = require(CONFIG.breakServiceAccountPath);
+
+// Lazy-init sheets client for grid expansion
+let _gridSheets = null;
+async function _getGridSheets() {
+  if (_gridSheets) return _gridSheets;
+  const auth = new google.auth.GoogleAuth({ credentials: key, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
+  _gridSheets = google.sheets({ version: "v4", auth });
+  return _gridSheets;
+}
+
+/**
+ * Expand Archives sheet grid if it doesn't have enough rows.
+ */
+async function ensureArchiveGrid(ssId, neededRows) {
+  try {
+    const sheets = await _getGridSheets();
+    const ss = await sheets.spreadsheets.get({ spreadsheetId: ssId });
+    const archSheet = ss.data.sheets.find(function(s) { return s.properties.title === "Archives"; });
+    if (!archSheet) return;
+    const currentRows = archSheet.properties.gridProperties.rowCount || 0;
+    if (neededRows > currentRows) {
+      const addRows = neededRows - currentRows;
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: ssId,
+        requestBody: {
+          requests: [{
+            appendDimension: {
+              sheetId: archSheet.properties.sheetId,
+              dimension: "ROWS",
+              length: addRows
+            }
+          }]
+        }
+      });
+      console.log("[ArchiveWorker] Expanded Archives grid by " + addRows + " rows (was " + currentRows + ", now " + neededRows + ")");
+    }
+  } catch(e) {
+    console.warn("[ArchiveWorker] Grid expansion warning:", e.message);
+  }
+}
+
 
 // Track the last date we checked (YYYY-MM-DD) to avoid re-archiving
 let lastArchivedDate = null;
@@ -109,6 +152,15 @@ async function runArchive() {
       ? existingArchive.length + 1
       : 1;
 
+    // Mark as archived BEFORE write to prevent duplicate 15-min runs
+    lastArchivedDate = todayStr;
+
+    // Calculate final row position and expand grid if needed
+    const lastNeed = existingArchive && existingArchive.length > 0
+      ? archiveStartRow - 1 + rowsToMove.length
+      : 1 + rowsToMove.length;
+    await ensureArchiveGrid(ssId, lastNeed + 5);
+
     // If Archives is empty, write header first
     if (!existingArchive || existingArchive.length === 0) {
       await updateRange(ssId, "'Archives'!A1", [data[0]]);
@@ -121,15 +173,40 @@ async function runArchive() {
     if (rowsToKeep.length > 0) {
       await updateRange(ssId, "'CS BREAK'!A1:O" + rowsToKeep.length, rowsToKeep);
 
-      // Clear remaining rows beyond what we wrote
-      if (rowsToKeep.length < 500) {
-        const emptyRows = [];
-        for (let i = 0; i < 500 - rowsToKeep.length; i++) emptyRows.push(Array(15).fill(''));
-        try {
-          await updateRange(ssId, "'CS BREAK'!A" + (rowsToKeep.length + 1) + ":O500", emptyRows);
-        } catch(e) {
-          // Range may be out of bounds, ignore
+      // Delete rows beyond what we wrote (cleaner than writing empties)
+      // Uses a single API call to remove all excess rows below the kept data.
+      try {
+        // We need to find the sheet grid extents to know how far to delete
+        const { google } = require("googleapis");
+        const key = require(CONFIG.breakServiceAccountPath);
+        const auth = new google.auth.GoogleAuth({ credentials: key, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
+        const gsheets = google.sheets({ version: "v4", auth });
+        const ssInfo = await gsheets.spreadsheets.get({ spreadsheetId: ssId });
+        const csSheet = ssInfo.data.sheets.find(function(s) { return s.properties.title === "CS BREAK"; });
+        if (csSheet) {
+          const totalRows = csSheet.properties.gridProperties.rowCount || 1000;
+          const rowsToDelete = totalRows - rowsToKeep.length;
+          if (rowsToDelete > 0 && rowsToKeep.length < totalRows) {
+            await gsheets.spreadsheets.batchUpdate({
+              spreadsheetId: ssId,
+              requestBody: {
+                requests: [{
+                  deleteDimension: {
+                    range: {
+                      sheetId: csSheet.properties.sheetId,
+                      dimension: "ROWS",
+                      startIndex: rowsToKeep.length,
+                      endIndex: totalRows
+                    }
+                  }
+                }]
+              }
+            });
+            console.log("[ArchiveWorker] Deleted " + rowsToDelete + " excess rows from CS BREAK (kept " + rowsToKeep.length + ")");
+          }
         }
+      } catch(e) {
+        console.warn("[ArchiveWorker] Row cleanup warning:", e.message);
       }
     }
 

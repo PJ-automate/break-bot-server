@@ -9,7 +9,7 @@ const db = require('./break-db');
 const CONFIG = require('./config');
 const { breakAppendRow, breakUpdateRange, updateRange, getBreakSheetId, reapplyBreakNumberFormats } = require('./google');
 
-const SYNC_TIMEOUT = 30000; // 30s per sync operation
+const SYNC_TIMEOUT = 90000; // 90s — OVH France has high latency to Google APIs
 var processing = false;
 var SH = CONFIG.breakSheetId;
 
@@ -83,6 +83,30 @@ async function processSyncQueue() {
                     item.google_sheet_row = newRow;
                     db.getDB().prepare('UPDATE breaks SET google_sheet_row = ? WHERE id = ?').run(newRow, item.sq_break_id);
                     console.log('[SyncWorker] End break appended as new row ' + newRow + ' for #' + item.break_id);
+                    // Complete row has ALL data — mark done immediately to prevent retry loop
+                    db.markSyncDone(item.id, item.sq_break_id, newRow);
+                    // Fire-and-forget daily summary update
+                    setTimeout(function() {
+                      try {
+                        var ds = require('./break-bot');
+                        if (typeof ds.updateDailySummary === 'function') {
+                          var dsDate = currentRow.business_date || '';
+                          var dsUser = currentRow.user_name || '';
+                          var dsShift = currentRow.shift_type || '';
+                          var dsPeriod = currentRow.shift_period || '';
+                          var dsTotal = eTotal || '';
+                          var dsRem = eRem || '';
+                          if (dsDate && dsUser) {
+                            ds.updateDailySummary(dsDate, dsUser, dsShift, dsPeriod, dsTotal, dsRem)
+                              .then(function() { console.log('[SyncWorker] Daily summary updated for ' + dsUser + ' ' + dsDate); })
+                              .catch(function(e) { console.warn('[SyncWorker] Daily summary update error (non-blocking):', e.message); });
+                          }
+                        }
+                      } catch(e) {
+                        console.warn('[SyncWorker] Daily summary import error (non-blocking):', e.message);
+                      }
+                    }, 100);
+                    continue;
                   }
                 }
               } catch (appendErr) {
@@ -201,6 +225,29 @@ async function syncEndBreak(item) {
   await withTimeout(breakUpdateRange(SH, 'CS BREAK!O' + rowIndex, [[statusIcon]]), SYNC_TIMEOUT, 'breakUpdateRange O');
 
   console.log('[SyncWorker] End break updated at row ' + rowIndex);
+
+  // Fire-and-forget daily summary update (non-blocking — does not affect sync retry loop)
+  setTimeout(function() {
+    try {
+      var ds = require('./break-bot');
+      if (typeof ds.updateDailySummary === 'function') {
+        var dsDate = item.business_date || '';
+        var dsUser = item.user_name || '';
+        var dsShift = item.shift_type || '';
+        var dsPeriod = item.shift_period || '';
+        var dsTotal = totalStr || '';
+        var dsRem = remainingStr || '';
+        if (dsDate && dsUser) {
+          ds.updateDailySummary(dsDate, dsUser, dsShift, dsPeriod, dsTotal, dsRem)
+            .then(function() { console.log('[SyncWorker] Daily summary updated for ' + dsUser + ' ' + dsDate); })
+            .catch(function(e) { console.warn('[SyncWorker] Daily summary update error (non-blocking):', e.message); });
+        }
+      }
+    } catch(e) {
+      console.warn('[SyncWorker] Daily summary import error (non-blocking):', e.message);
+    }
+  }, 100);
+
 }
 
 /**

@@ -8,10 +8,8 @@
 const express = require('express');
 const CONFIG = require('./config');
 const { handleBreakUpdate, getDashboardData } = require('./break-bot');
-const db = require('./break-db');
-const syncWorker = require('./sync-worker');
-const archiveWorker = require('./archive-worker');
-const { initBreakAuth, readRange } = require('./google');
+const buffer = require('./break-buffer');
+const { initBreakAuth } = require('./google');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -73,9 +71,10 @@ app.get('/set-break-webhook', async (req, res) => {
   try {
     const webhookUrl = req.query.url;
     if (!webhookUrl) return res.status(400).send('Missing ?url=');
+
     const axios = require('axios');
     const result = await axios.get(
-      'https://api.telegram.org/bot' + CONFIG.breakBotToken + '/setWebhook?url=' + encodeURIComponent(webhookUrl)
+      `https://api.telegram.org/bot${CONFIG.breakBotToken}/setWebhook?url=${encodeURIComponent(webhookUrl)}`
     );
     res.json(result.data);
   } catch (err) {
@@ -98,34 +97,21 @@ app.get('/health', (req, res) => {
 //  STARTUP
 // ============================================================
 async function start() {
-  // Initialize SQLite database
-  db.initDB();
-
-  // Import existing data from Google Sheet (one-time migration)
-  try {
-    await initBreakAuth();
-    console.log('[Startup] Importing break records from Google Sheet...');
-    const data = await readRange(CONFIG.breakSheetId, 'CS BREAK!A:O');
-    if (data && data.length > 1) {
-      var imported = db.importFromSheetData(data);
-      console.log('[Startup] Imported ' + imported + ' break records from Google Sheet');
-    }
-  } catch (err) {
-    console.error('[Startup] Sheet import error (non-fatal):', err.message);
-    console.log('[Startup] Continuing with empty database - data will sync as users interact');
+  const authOk = await initBreakAuth();
+  if (!authOk) {
+    console.error('[BreakBot] Google Auth failed. Check service account path.');
+    process.exit(1);
   }
 
-  // Start background sync worker (every 5 seconds)
-  syncWorker.startSyncWorker(5000);
-
-  // Start archive worker (checks every 15 minutes for midnight crossover)
-  archiveWorker.startArchiveWorker(900000);
+  // Process any pending buffer entries from previous runs (crashes/restarts)
+  buffer.processBuffer().catch(function(e) {
+    console.error('[Buffer] Startup process error:', e.message);
+  });
 
   app.listen(CONFIG.port, CONFIG.host, () => {
-    console.log('[BreakBot] Server running on http://' + CONFIG.host + ':' + CONFIG.port);
-    console.log('[BreakBot] Webhook: /webhook-break');
-    console.log('[BreakBot] Dashboard: /api/breaks/dashboard');
-    console.log('[BreakBot] Archive: auto-archive will run at midnight PH time');
+    console.log(`[BreakBot] Server running on http://${CONFIG.host}:${CONFIG.port}`);
+    console.log(`[BreakBot] Webhook: /webhook-break`);
+    console.log(`[BreakBot] Dashboard: /api/breaks/dashboard`);
   });
 }
 

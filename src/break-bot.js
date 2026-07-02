@@ -4,28 +4,19 @@
  * Replaces the Google Apps Script version entirely.
  */
 
+const fs = require('fs');
+const path = require('path');
 const axios = require('axios');
 const CONFIG = require('./config');
 const { readRange, appendRow, updateRange, breakAppendRow, breakUpdateRange, getOrCreateSheet, formatBreakSheets, reapplyBreakNumberFormats, getBreakSheetId, breakBatchUpdate } = require('./google');
-const buffer = require('./break-buffer');
+const db = require('./break-db');
+const syncWorker = require('./sync-worker');
 
 // In-memory shift cache (5 min TTL)
 const shiftCache = new Map();
 
 // Sheet-ready flag — skip getOrCreateSheet after first successful check (saves ~2s/op)
 var BREAK_SHEETS_READY = false;
-
-// Data cache — reuses readBreakData result across multiple reads within the same interaction.
-// Clears after 8 seconds so subsequent operations within a single interaction
-// (start + sheet write + notification) all share one read instead of re-reading.
-var dataCache = { data: null, timestamp: 0 };
-var DATA_CACHE_TTL = 8000;
-
-// Active break in-memory index — userId → { row, data }
-// Eliminates the 1-2s readRange('CS BREAK!A:O') call in getActiveBreakRow.
-// Populated lazily on first getActiveBreakRow hit; updated on start/end.
-// Process-lifetime — survives across webhooks but not restarts (graceful fallback to sheet read).
-var activeBreakIndex = new Map();
 
 // Total-used cache — key: userId_businessDate_shift_period → seconds used.
 // Eliminates readRange('CS BREAK!A:O') in endBreak for prev totals.
@@ -146,9 +137,12 @@ function fmtRemaining(s) {
 
 function getBusinessDate(date, shiftType) {
   var c = getPHComponents(date);
+  // NightShift runs 00:00AM-11:59AM PH time.
+  // Business date stays as the current calendar date (no rollback).
   if (shiftType === 'Graveyard' || shiftType === 'NightShift') {
     if (c.hour >= 0 && c.hour < 12) return formatYMD(c.year, c.month, c.day);
-    // Add one day with proper month/year rollover using Date
+    // If PH hour is 12-23 (daytime) but shift is NightShift, add a day
+    // (edge case: starting tomorrow's NightShift record during today's DayShift)
     var next = new Date(c.year, c.month - 1, c.day + 1);
     return formatYMD(next.getFullYear(), next.getMonth() + 1, next.getDate());
   }
@@ -469,32 +463,17 @@ function clearCachedShift(userId) {
 }
 
 async function findTodayShift(userId) {
-  const cached = getCachedShift(userId);
+  // INSTANT: cache only. No Google Sheets read.
+  // Shift is cached on first /start or startBreak and auto-detected from PH time.
+  var cached = getCachedShift(userId);
   if (cached) return cached;
 
-  const data = await readBreakData();
-  if (!data || data.length < 2) return null;
-
-  const phNow = toPH(new Date());
-  const today = fmtDate(phNow, 'yyyy-MM-dd');
-
-  for (let i = data.length - 1; i >= 1; i--) {
-    const rowUserId = fmtCell(data[i][10]);
-    if (rowUserId !== String(userId)) continue;
-    const shift = fmtCell(data[i][2]);
-    if (shift !== '8h' && shift !== '12h') continue;
-    const period = fmtCell(data[i][3]);
-    const rowDate = data[i][0];
-    if (!rowDate) continue;
-
-    const bd = getBusinessDate(parseDateCell(rowDate), period);
-    if (bd === today) {
-      const result = { shift, period };
-      setCachedShift(userId, shift, period);
-      return result;
-    }
-  }
-  return null;
+  // Auto-detect from PH time as fallback
+  var phHour = getPHHour();
+  var period = (phHour >= 12) ? 'DayShift' : 'NightShift';
+  var result = { shift: '12h', period: period };
+  setCachedShift(userId, result.shift, result.period);
+  return result;
 }
 
 async function getUserName(userId) {
@@ -509,24 +488,18 @@ async function getUserName(userId) {
 }
 
 async function getActiveBreakRow(userId) {
-  // Check in-memory index first — instant, no API calls.
-  // The index is populated lazily on first hit and updated on every start/end.
-  var idx = activeBreakIndex.get(String(userId));
-  if (idx) return idx;
-
-  // Fall back to sheet read (slow path: happens after restart or external edit).
-  const data = await readBreakData();
-  if (!data) return null;
-  for (let i = data.length - 1; i >= 1; i--) {
-    const uid = fmtCell(data[i][10]);
-    const endTime = data[i][6];
-    const shift = fmtCell(data[i][2]);
-    const btype = fmtCell(data[i][4]);
-    if (uid === String(userId) && (!endTime || String(endTime).trim() === '') && shift !== 'RESET' && btype !== 'SHIFT_SET') {
-      var result = { row: i + 1, data: data[i] };
-      activeBreakIndex.set(String(userId), result); // populate index for future
-      return result;
-    }
+  // INSTANT: read from SQLite (local, no network I/O)
+  var active = db.getActiveBreak(userId);
+  if (active) {
+    return {
+      row: active.id,
+      data: [
+        active.business_date, active.user_name, active.shift_type,
+        active.shift_period, active.break_type, active.start_time,
+        active.end_time, '', '', '', active.user_id, '',
+        active.status, active.break_id, ''
+      ]
+    };
   }
   return null;
 }
@@ -537,24 +510,12 @@ async function getActiveBreakRow(userId) {
 
 async function handleBreakUpdate(update) {
   try {
-    await getBreakSheet();
+    // Initialize DB if not already (safe to call multiple times)
+    if (!db.getDB) db.initDB();
+    try { db.getDB(); } catch(e) { db.initDB(); }
 
-    // One-time professional formatting for existing sheets
-    if (!FORMAT_APPLIED) {
-      FORMAT_APPLIED = true;
-      console.log('[BreakBot] Applying professional formatting to existing sheets...');
-      try {
-        await formatBreakSheets(SH);
-        console.log('[BreakBot] Professional formatting applied');
-      } catch (err) {
-        console.error('[BreakBot] Formatting error (non-fatal):', err.message);
-      }
-    }
-
-    // Archive check: runs on EVERY interaction so midnight archive works
-    // even if no one ends a break at exactly 12:00 AM.
-    // Returns near-instantly except at midnight (PH hour 0).
-    await archiveOldData().catch(function() {});
+    // Trigger sync worker (non-blocking — processes pending sheet syncs)
+    syncWorker.processSyncQueue().catch(function() {});
 
     // Callback query
     if (update.callback_query) {
@@ -621,8 +582,9 @@ async function handleCallback(cb) {
       var phStr = new Date().toLocaleString('en-US', { timeZone: 'Asia/Manila', hour12: false });
       var phHour = parseInt(phStr.split(/[,\s]+/)[3].split(':')[0], 10);
       var period = (phHour >= 12) ? 'DayShift' : 'NightShift';
-      await updateShiftInSheet(clickerId, shift, period);
+      // INSTANT: set cache first, then update sheet asynchronously
       setCachedShift(clickerId, shift, period);
+      updateShiftInSheet(clickerId, shift, period).catch(function() {});
       return sendBreakTypeMenu(chatId, shift, period, userName, clickerId);
     }
     return sendShiftPeriodMenu(chatId, shift, userName, clickerId);
@@ -630,8 +592,9 @@ async function handleCallback(cb) {
 
   if (action.startsWith('period_')) {
     const parts = action.split('_');
-    await updateShiftInSheet(clickerId, parts[1], parts[2]);
+    // INSTANT: set cache first, then update sheet asynchronously
     setCachedShift(clickerId, parts[1], parts[2]);
+    updateShiftInSheet(clickerId, parts[1], parts[2]).catch(function() {});
     return sendBreakTypeMenu(chatId, parts[1], parts[2], userName, clickerId);
   }
 
@@ -702,19 +665,10 @@ async function showMenu(chatId, user, userId) {
   if (cached) {
     cached.period = autoCorrectPeriod(cached.shift, cached.period);
     setCachedShift(userId, cached.shift, cached.period);
-    await updateShiftInSheet(userId, cached.shift, cached.period).catch(() => {});
     return sendBreakTypeMenu(chatId, cached.shift, cached.period, user, userId);
   }
 
-  const existing = await findTodayShift(userId);
-  if (existing) {
-    existing.period = autoCorrectPeriod(existing.shift, existing.period);
-    setCachedShift(userId, existing.shift, existing.period);
-    await updateShiftInSheet(userId, existing.shift, existing.period).catch(() => {});
-    return sendBreakTypeMenu(chatId, existing.shift, existing.period, user, userId);
-  }
-
-  // AUTO-DETECT shift based on current PH time
+  // INSTANT: auto-detect shift from PH time — no Google Sheets read.
   var phHour = getPHHour();
   var phDebugStr = new Date().toLocaleString("en-US", { timeZone: "Asia/Manila", hour12: false });
   console.log('[BreakBot] showMenu auto-detect:', { phHour, phDebugStr, serverHour: new Date().getHours(), tzOffset: new Date().getTimezoneOffset() });
@@ -727,8 +681,6 @@ async function showMenu(chatId, user, userId) {
     period = 'NightShift';
   }
 
-  // Auto-set shift in sheet and cache
-  await updateShiftInSheet(userId, shift, period);
   setCachedShift(userId, shift, period);
 
   const labels = {
@@ -741,27 +693,12 @@ async function showMenu(chatId, user, userId) {
 
 async function sendShiftPeriodMenu(chatId, shift, user, userId) {
   var phHour = getPHHour();
-
-  let keyboard;
-  if (shift === '8h') {
-    const opts = [];
-    if (phHour >= 12 && phHour < 16)
-      opts.push('Morning');
-    if (phHour >= 16 && phHour < 20)
-      opts.push('Middle');
-    if (phHour >= 20 || phHour < 12)
-      opts.push('Graveyard');
-
-    const labels = { Morning: '🌅 Morning (11AM-3PM BKK / 12PM-4PM PH)', Middle: '🌤 Middle (3PM-7PM BKK / 4PM-8PM PH)', Graveyard: '🌑 Graveyard (7PM-11PM BKK / 8PM-12AM PH)' };
-    keyboard = opts.map(o => [{ text: labels[o], callback_data: `period_${shift}_${o}` }]);
-    if (keyboard.length === 0) keyboard = [[{ text: '🌑 Graveyard', callback_data: `period_${shift}_Graveyard` }]]; // fallback
+  var keyboard;
+  // 12h only: period matching current PH time
+  if (phHour >= 12) {
+    keyboard = [[{ text: '☀️ Day Shift (11AM-11PM BKK / 12PM-11:59PM PH)', callback_data: `period_${shift}_DayShift` }]];
   } else {
-    // 12h: only allow period matching current PH time
-    if (phHour >= 12) {
-      keyboard = [[{ text: '☀️ Day Shift (11AM-11PM BKK / 12PM-12AM PH)', callback_data: `period_${shift}_DayShift` }]];
-    } else {
-      keyboard = [[{ text: '🌑 Night Shift (11PM-11AM BKK / 12AM-12PM PH)', callback_data: `period_${shift}_NightShift` }]];
-    }
+    keyboard = [[{ text: '🌑 Night Shift (11PM-11AM BKK / 00:00AM-11:59AM PH)', callback_data: `period_${shift}_NightShift` }]];
   }
   return sendMsg(chatId,
     `👤 *User:* ${user}\n*Shift:* ${shift}\n\nChoose your period:\n\n[ID: ${userId}]`,
@@ -771,7 +708,6 @@ async function sendShiftPeriodMenu(chatId, shift, user, userId) {
 
 async function sendBreakTypeMenu(chatId, shift, period, user, userId, customMsg) {
   const labels = {
-    Morning: '🌅 Morning', Middle: '🌤 Middle', Graveyard: '🌑 Graveyard',
     DayShift: '☀️ Day Shift', NightShift: '🌑 Night Shift'
   };
   const defaultMsg = `👤 *${user}*\n⚡ *${shift}* (${labels[period] || period})\n\nSelect break type:\n\n[ID: ${userId}]`;
@@ -896,18 +832,6 @@ async function startBreak(chatId, userId, userName, shiftType, shiftPeriod, brea
     console.log('[BreakBot] Auto-correcting period:', sPeriod, '→', correctPeriod);
     sPeriod = correctPeriod;
   }
-  if (sType === '8h') {
-    // For 8h shifts, also validate period against current hour
-    // (Morning 12-4PM, Middle 4-8PM, Graveyard 8PM-12AM PH)
-    if (sPeriod === 'Morning' && !(phHour >= 12 && phHour < 16)) {
-      sPeriod = (phHour >= 20 || phHour < 12) ? 'Graveyard' : (phHour >= 16 ? 'Middle' : 'Morning');
-    } else if (sPeriod === 'Middle' && !(phHour >= 16 && phHour < 20)) {
-      sPeriod = (phHour >= 20 || phHour < 12) ? 'Graveyard' : (phHour >= 12 ? 'Morning' : 'Middle');
-    } else if (sPeriod === 'Graveyard' && !(phHour >= 20 || phHour < 12)) {
-      sPeriod = (phHour >= 16) ? 'Middle' : 'Morning';
-    }
-  }
-
   // Compute business date (MUST use corrected period)
   const bd = getBusinessDate(now, sPeriod);
   console.log('[BreakBot] startBreak time:', { timeStr, bd, finalPeriod: sPeriod });
@@ -918,69 +842,27 @@ async function startBreak(chatId, userId, userName, shiftType, shiftPeriod, brea
   const rnd = Math.floor(Math.random() * 10000);
   const breakId = `CSB${dateStr}${String(ts).slice(-8)}${String(rnd).padStart(4, '0')}`;
 
+  // Save to SQLite INSTANTLY (local, no network I/O) — source of truth
+  var result = db.startBreak(bd, userName, sType, sPeriod, breakType, timeStr, userId);
+  console.log('[BreakBot] Break saved to SQLite: id=' + result.id + ' breakId=' + result.breakId);
+
   // Send notification to the group monitoring channel FIRST (~0.5s)
   const phTime = fmtTime(now);
   const bkkTime = fmtTime(now, "Asia/Bangkok");
   console.log('[BreakBot] Sending break start notification to', CONFIG.breakGroupId);
   await sendMsg(CONFIG.breakGroupId,
-    `🔴 *BREAK STARTED*\n👤 ${userName}\n☕ ${breakType}\n🆔 ${breakId}\n🕐 ${bkkTime} BKK / ${phTime} PH`
+    `🔴 *BREAK STARTED*\n👤 ${userName}\n☕ ${breakType}\n🆔 ${result.breakId}\n🕐 ${bkkTime} BKK / ${phTime} PH`
   ).catch(() => {});
 
   // Send personal confirmation IMMEDIATELY — user sees response in <1s
-  // Sheet append happens asynchronously after; if it fails, we send a correction.
   if (CONFIG.breakGroupId !== String(chatId)) {
     await sendMsg(chatId,
       `☕ *${breakType} break started!*\n🕐 ${phTime} PH\n\n_Use /end when you return._`
     ).catch(() => {});
   }
 
-  // Pre-populate active break index so /end works even before sheet write completes
-  var pendingRowData = [dateToSerial(bd), userName, sType, sPeriod, breakType, timeToSerial(timeStr), '', '', '', '', userId, '', '🔴 ON BREAK', breakId, '🔴 ON BREAK'];
-  activeBreakIndex.set(String(userId), { row: 0, data: pendingRowData });
-
-  // Save to local buffer IMMEDIATELY — survives server restart even if Google Sheets is down
-  buffer.addPending('start', {
-    bd: bd, userName: userName, shiftType: sType, shiftPeriod: sPeriod,
-    breakType: breakType, timeStr: timeStr, userId: userId, breakId: breakId
-  });
-
-  // Append to sheet — DO NOT AWAIT.
-  // The sheet write is the slowest part (1-25s). By not awaiting, the user gets
-  // instant feedback and the sheet catches up in the background.
-  appendBreakRow([
-    bd, userName, sType, sPeriod, breakType, timeStr,
-    '', '', '', '', userId, '', '🔴 ON BREAK', breakId, '🔴 ON BREAK'
-  ]).then(function(saved) {
-    if (saved && saved.ok) {
-      // Update the index with the actual row number
-      var newRowData = [dateToSerial(bd), userName, sType, sPeriod, breakType, timeToSerial(timeStr), '', '', '', '', userId, '', '🔴 ON BREAK', breakId, '🔴 ON BREAK'];
-      activeBreakIndex.set(String(userId), { row: saved.row, data: newRowData });
-      console.log('[BreakBot] Sheet append complete, row=' + saved.row);
-    } else {
-      // Sheet append failed — send correction
-      console.warn('[BreakBot] Sheet append returned ok:false');
-      sendMsg(CONFIG.breakGroupId,
-        `⚠️ *CORRECTION* — ${userName}'s ${breakType} break FAILED to save to sheet. Please try /start again.`
-      ).catch(() => {});
-      if (CONFIG.breakGroupId !== String(chatId)) {
-        sendMsg(chatId,
-          `❌ *Failed to log ${breakType} break in sheet.*\nPlease try /start again or contact support.`
-        ).catch(() => {});
-      }
-      activeBreakIndex.delete(String(userId));
-    }
-  }).catch(function(appendErr) {
-    console.error('[BreakBot] Sheet append error:', appendErr.message);
-    sendMsg(CONFIG.breakGroupId,
-      `⚠️ *ERROR* — ${userName}'s ${breakType} break failed to save: ${appendErr.message}`
-    ).catch(() => {});
-    if (CONFIG.breakGroupId !== String(chatId)) {
-      sendMsg(chatId,
-        `❌ *Failed to log ${breakType} break in sheet.*\nPlease try /start again or contact support.`
-      ).catch(() => {});
-    }
-    activeBreakIndex.delete(String(userId));
-  });
+  // Trigger sync worker (non-blocking — pushes to Google Sheets asynchronously)
+  syncWorker.processSyncQueue().catch(function() {});
 }
 
 // ============================================================
@@ -992,87 +874,11 @@ async function endBreak(chatId, userId, userName) {
   const now = new Date();
   const timeStr = fmtTime(now);
 
-  const active = await getActiveBreakRow(userId);
-  console.log('[BreakBot] Active break found:', active ? 'yes' : 'no', active ? 'row=' + active.row : '');
-  if (!active) {
+  // Use SQLite for instant local end — no Google Sheets call
+  var result = db.endBreak(userId, timeStr);
+  if (!result) {
     return sendMsg(chatId, `❌ *${userName}*, no active break found to end!`);
   }
-
-  const rowIndex = active.row;
-  const d = active.data;
-
-  const breakDate = parseDateCell(d[0]);
-  const shiftPeriod = fmtCell(d[3]);
-  const shiftType = fmtCell(d[2]);
-  const breakType = fmtCell(d[4]);
-
-  // --- DURATION CALCULATION USING UTC TIMESTAMPS ---
-  // PH time = UTC+8, so we convert PH components to UTC for clean math.
-  // This handles day/month/year boundaries correctly (no day-of-month hacks).
-  var phNow = getPHComponents(new Date());
-
-  var startStr = parseTimeCell(d[5]);
-  var tp = startStr.split(':');
-  var startH = parseInt(tp[0], 10) || 0;
-  var startM = parseInt(tp[1], 10) || 0;
-  var startS = parseInt(tp[2], 10) || 0;
-
-  // Get the business date from the stored break date (Column A)
-  // Use breakDate (parsed via parseDateCell) instead of raw d[0], because
-  // readRange returns d[0] as the string "46204" when the cell has no DATE
-  // format, and new Date("46204") yields Invalid Date → NaN → zero duration.
-  var breakPH = getPHComponents(breakDate);
-
-  // Convert PH date+time to UTC timestamps (PH = UTC+8)
-  var startTs = Date.UTC(breakPH.year, breakPH.month - 1, breakPH.day, startH - 8, startM, startS);
-  var endTs = Date.UTC(phNow.year, phNow.month - 1, phNow.day, phNow.hour - 8, phNow.min, phNow.sec);
-
-  // Elapsed seconds in PH time (timestamp difference is timezone-independent)
-  var diffSecs = Math.floor((endTs - startTs) / 1000);
-  if (diffSecs < 0) diffSecs = 0;
-
-  var remark = '';
-  if (diffSecs > 3600) remark = 'LONG BREAK';
-
-  const allowanceSecs = (shiftType === '12h') ? 7200 : 5400;
-  const bd = getBusinessDate(breakDate, shiftPeriod);
-
-  // Get previous totals — check cache FIRST (no API call on hit).
-  // Cache key includes date+shift so it auto-expires per day.
-  // Cache miss → read DAILY SUMMARY (5 rows, ~0.5s) instead of full CS BREAK (15+ rows, ~2s).
-  const cacheKey = getTotalUsedCacheKey(userId, bd, shiftType, shiftPeriod);
-  let prevSecs = totalUsedCache.has(cacheKey) ? totalUsedCache.get(cacheKey) : null;
-
-  if (prevSecs === null) {
-    // Cache miss — fast read from DAILY SUMMARY (only 5 rows)
-    var summaryData = await readSummaryData();
-    prevSecs = 0;
-    if (summaryData) {
-      var summaryDateStr = bd; // same business date format
-      for (var si = 1; si < summaryData.length; si++) {
-        var sDate = summaryData[si][0] instanceof Date ? fmtDate(summaryData[si][0], 'yyyy-MM-dd') : fmtCell(summaryData[si][0]);
-        if (sDate === summaryDateStr && fmtCell(summaryData[si][1]) === userName && fmtCell(summaryData[si][2]) === (shiftType + ' (' + shiftPeriod + ')')) {
-          var usedVal = summaryData[si][3];
-          if (usedVal) prevSecs = parseDur(usedVal);
-          break;
-        }
-      }
-    }
-  }
-
-  const finalTotal = prevSecs + diffSecs;
-  totalUsedCache.set(cacheKey, finalTotal); // cache for next endBreak (no re-read needed)
-  const finalRemaining = allowanceSecs - finalTotal;
-  const curHMS = fmtHMS(diffSecs);
-  const totalHMS = fmtHMS(finalTotal);
-  const remHMS = fmtRemaining(finalRemaining);
-
-  // Determine final remark before any I/O
-  let finalRemark = remark;
-  if (finalTotal > allowanceSecs) {
-    finalRemark = 'OVERBREAK';
-  }
-
 
   // ===== SEND INSTANT FEEDBACK — user sees response in <1s =====
   const phTime = fmtTime(now, "Asia/Manila");
@@ -1080,121 +886,18 @@ async function endBreak(chatId, userId, userName) {
 
   // Group notification (fast)
   await sendMsg(CONFIG.breakGroupId,
-    `🟢 *BREAK ENDED*\n👤 ${userName}\n☕ ${breakType}\n⏱️ *Duration:* ${curHMS}\n📊 *Total:* ${totalHMS}\n⏳ *Remaining:* ${remHMS}\n🕐 ${bkkTime} BKK / ${phTime} PH`
+    `🟢 *BREAK ENDED*\n👤 ${userName}\n☕ ${result.breakType}\n⏱️ *Duration:* ${result.curHMS}\n📊 *Total:* ${result.totalHMS}\n⏳ *Remaining:* ${result.remHMS}\n🕐 ${bkkTime} BKK / ${phTime} PH`
   ).catch(function() {});
 
   // Personal confirmation IMMEDIATELY (fast — just Telegram API, no sheet I/O)
   if (CONFIG.breakGroupId !== String(chatId)) {
     await sendMsg(chatId,
-      `✅ *Break ended*\n☕ ${breakType}\n⏱️ ${curHMS}\n📊 Total: ${totalHMS}\n⏳ Remaining: ${remHMS}`
+      `✅ *Break ended*\n☕ ${result.breakType}\n⏱️ ${result.curHMS}\n📊 Total: ${result.totalHMS}\n⏳ Remaining: ${result.remHMS}`
     ).catch(function() {});
   }
 
-  // Remove from active break index (user no longer on break)
-  activeBreakIndex.delete(String(userId));
-
-  // ===== SHEET OPERATIONS — ASYNC (don't block user) =====
-  // These run in the background. If they fail, a correction is sent.
-  // Local buffer ensures data survives a server restart.
-  (async function() {
-    // Save to local buffer FIRST — instant, no network I/O
-    buffer.addPending('end', {
-      breakId: breakIdFromRow(d),
-      rowIndex: rowIndex, timeStr: timeStr, curHMS: curHMS,
-      remHMS: remHMS, finalRemark: finalRemark || '', totalHMS: totalHMS,
-      bd: bd, userName: userName, shiftType: shiftType, shiftPeriod: shiftPeriod
-    });
-    try {
-      if (finalRemark === 'OVERBREAK') {
-        await trackOverbreak(userName, userId, shiftType, shiftPeriod, breakType, startStr, timeStr, curHMS, bd);
-      }
-      await writeEndBreakToSheet(rowIndex, timeStr, curHMS, remHMS, finalRemark, totalHMS);
-      await updateDailySummary(bd, userName, shiftType, shiftPeriod, totalHMS, remHMS);
-    } catch (sheetErr) {
-      console.error('[BreakBot] endBreak sheet error:', sheetErr.message);
-      sendMsg(CONFIG.breakGroupId,
-        `⚠️ *CORRECTION* — ${userName}'s ${breakType} end-break failed to save: ${sheetErr.message}`
-      ).catch(function() {});
-      if (CONFIG.breakGroupId !== String(chatId)) {
-        sendMsg(chatId,
-          `⚠️ *Break ended but sheet save failed.*\nError: ${sheetErr.message}`
-        ).catch(function() {});
-      }
-    }
-  })();
-}
-
-/**
- * Write end-break values to the CS BREAK sheet via single batchUpdate.
- * Extracted from endBreak for clearer error handling.
- */
-async function writeEndBreakToSheet(rowIndex, timeStr, curHMS, remHMS, finalRemark, totalHMS) {
-  const statusIcon = finalRemark ? ("⚠️ " + finalRemark) : "🟢 RETURNED";
-  const batchSid = await getBreakSheetId(SH);
-  if (batchSid) {
-    const ri = rowIndex - 1; // 0-indexed
-    const reqs = [];
-
-    // G-J: End Time (serial+TIME), Duration (serial+TIME), Remaining (text), Remark (text)
-    reqs.push({
-      updateCells: {
-        range: { sheetId: batchSid, startRowIndex: ri, endRowIndex: ri + 1, startColumnIndex: 6, endColumnIndex: 10 },
-        rows: [{ values: [
-          { userEnteredValue: { numberValue: timeToSerial(timeStr) }, userEnteredFormat: { numberFormat: { type: 'TIME', pattern: 'HH:mm:ss' } } },
-          { userEnteredValue: { numberValue: timeToSerial(curHMS) }, userEnteredFormat: { numberFormat: { type: 'TIME', pattern: 'HH:mm:ss' } } },
-          { userEnteredValue: { stringValue: remHMS } },
-          { userEnteredValue: { stringValue: finalRemark } }
-        ] }],
-        fields: 'userEnteredValue,userEnteredFormat.numberFormat'
-      }
-    });
-
-    // L-M: Total Used (serial+TIME), Status (text)
-    reqs.push({
-      updateCells: {
-        range: { sheetId: batchSid, startRowIndex: ri, endRowIndex: ri + 1, startColumnIndex: 11, endColumnIndex: 13 },
-        rows: [{ values: [
-          { userEnteredValue: { numberValue: timeToSerial(totalHMS) }, userEnteredFormat: { numberFormat: { type: 'TIME', pattern: 'HH:mm:ss' } } },
-          { userEnteredValue: { stringValue: statusIcon } }
-        ] }],
-        fields: 'userEnteredValue,userEnteredFormat.numberFormat'
-      }
-    });
-
-    // O: Notes (text)
-    reqs.push({
-      updateCells: {
-        range: { sheetId: batchSid, startRowIndex: ri, endRowIndex: ri + 1, startColumnIndex: 14, endColumnIndex: 15 },
-        rows: [{ values: [
-          { userEnteredValue: { stringValue: statusIcon } }
-        ] }],
-        fields: 'userEnteredValue'
-      }
-    });
-
-    // A (DATE) + F (TIME) — already have values from startBreak, just apply format
-    reqs.push({ repeatCell: { range: { sheetId: batchSid, startRowIndex: ri, endRowIndex: ri + 1, startColumnIndex: 0, endColumnIndex: 1 },
-      cell: { userEnteredFormat: { numberFormat: { type: 'DATE', pattern: 'yyyy-mm-dd' } } }, fields: 'userEnteredFormat.numberFormat' }});
-    reqs.push({ repeatCell: { range: { sheetId: batchSid, startRowIndex: ri, endRowIndex: ri + 1, startColumnIndex: 5, endColumnIndex: 6 },
-      cell: { userEnteredFormat: { numberFormat: { type: 'TIME', pattern: 'HH:mm:ss' } } }, fields: 'userEnteredFormat.numberFormat' }});
-
-    // One API call: 3 value writes + 2 format-only = values+formats applied together
-    await breakBatchUpdate(SH, reqs);
-    console.log('[BreakBot] endBreak: batch update (' + reqs.length + ' reqs, values+formats)');
-  } else {
-    // Fallback: no sheet ID cached (should never happen after first format)
-    console.warn('[BreakBot] endBreak: sheet ID not cached, using fallback writes');
-    await breakUpdateRange(SH, `CS BREAK!G${rowIndex}:J${rowIndex}`, [[
-      timeToSerial(timeStr), timeToSerial(curHMS), remHMS, finalRemark
-    ]]);
-    await breakUpdateRange(SH, `CS BREAK!L${rowIndex}:M${rowIndex}`, [[
-      timeToSerial(totalHMS), statusIcon
-    ]]);
-    await breakUpdateRange(SH, `CS BREAK!O${rowIndex}`, [[statusIcon]]);
-    reapplyBreakNumberFormats(SH).catch(function(err) {
-      console.error('[BreakBot] fallback format error:', err ? err.message : 'unknown');
-    });
-  }
+  // Trigger sync worker (non-blocking — pushes to Google Sheets asynchronously)
+  syncWorker.processSyncQueue().catch(function() {});
 }
 
 // ============================================================
@@ -1230,99 +933,49 @@ async function updateDailySummary(date, user, shift, period, totalUsed, remainin
 // ============================================================
 
 async function sendUserHistory(chatId, userId, userName) {
-  const data = await readBreakData();
-  if (!data || data.length < 2) {
-    return sendMsg(chatId, `*${userName}*\n\n_No breaks recorded._`);
+  // INSTANT: read from SQLite — no network I/O
+  var breaks = db.getTodayHistory(userId);
+
+  if (!breaks || breaks.length === 0) {
+    return sendMsg(chatId, `👤 *${userName}*\n\n_No breaks recorded today._`);
   }
 
+  // Auto-detect shift period from current PH time (not from stored DB value)
   var phComponents = getPHComponents(new Date());
   var today = formatYMD(phComponents.year, phComponents.month, phComponents.day);
-  var phNowH = phComponents.hour;
+  var phHour = phComponents.hour;
+  var correctPeriod = (phHour >= 12) ? 'DayShift' : 'NightShift';
 
-  let shiftType = 'Not Set';
-  let allowance = 0;
-  const breaks = [];
+  // 12h shift only (8h removed)
+  var shiftType = '12h (' + correctPeriod + ')';
+  var allowance = 7200; // 2 hours for 12h shift
+  var totalSecs = 0;
+  var list = '';
+  var activeInfo = null;
 
-  for (let i = 1; i < data.length; i++) {
-    if (fmtCell(data[i][10]) !== String(userId)) continue;
-    const shift = fmtCell(data[i][2]);
-    if (shift === 'RESET') continue;
-    if (fmtCell(data[i][4]) === 'SHIFT_SET') continue;
-    if (!data[i][0]) continue;
+  for (var i = 0; i < breaks.length; i++) {
+    var b = breaks[i];
 
-    const period = fmtCell(data[i][3]);
-    const rawDate = data[i][0] instanceof Date ? fmtDate(data[i][0], "yyyy-MM-dd") : (typeof data[i][0] === 'number' ? fmtDate(parseDateCell(data[i][0]), "yyyy-MM-dd") : String(data[i][0]).substring(0, 10));
-    if (rawDate !== today) continue;
-
-    // PH time sanity check: skip if break's start hour is > current PH hour + 1
-    // (catches NightShift rows with wrong business dates from old timezone bug)
-    var startH = parseInt(parseTimeCell(data[i][5]).split(':')[0], 10);
-    if (startH > phNowH + 1) continue;
-
-    // SHIFT PERIOD MATCH: if current PH time is Night (0-11AM) but break started during
-    // Day (12-11:59PM), the break is from the previous shift — skip it.
-    // This ensures history only shows breaks from the CURRENT shift period.
-    // Day Shift = 12PM-11:59PM, Night Shift = 12AM-11:59AM
-    var phPeriod = (phNowH >= 12) ? 'day' : 'night';
-    var breakPeriod = (startH >= 12) ? 'day' : 'night';
-    if (phPeriod !== breakPeriod) continue;
-
-    if (shift && shiftType === 'Not Set' && (shift === '8h' || shift === '12h')) {
-      shiftType = `${shift} (${period || 'Unknown'})`;
-      allowance = shift === '8h' ? 5400 : 7200;
+    if (b.status === 'ON BREAK') {
+      activeInfo = { type: b.break_type, start: b.start_time };
+      continue;
     }
 
-    const start = parseTimeCell(data[i][5]);
-    const end = data[i][6] ? parseTimeCell(data[i][6]) : '';
-    // Recalculate duration from raw start/end times (timezone-independent math)
-    let dur = '00:00:00';
-    let durSecs = 0;
-    if (end && start) {
-      var sp = String(start).split(':').map(Number);
-      var ep = String(end).split(':').map(Number);
-      if (sp.length >= 2 && ep.length >= 2) {
-        var startSecs = sp[0] * 3600 + (sp[1] || 0) * 60 + (sp[2] || 0);
-        var endSecs = ep[0] * 3600 + (ep[1] || 0) * 60 + (ep[2] || 0);
-        durSecs = endSecs - startSecs;
-        if (durSecs < 0) durSecs += 86400; // midnight rollover
-        if (durSecs > 86400) durSecs = 86400; // sanity cap
-        dur = fmtHMS(durSecs);
-      }
-    }
-
-    breaks.push({
-      type: fmtCell(data[i][4]),
-      start, end, duration: dur, durSecs,
-      remark: fmtCell(data[i][9]),
-      isActive: !end
-    });
-  }
-
-  if (breaks.length === 0) {
-    return sendMsg(chatId, `👤 *${userName}* | ⏰ ${shiftType} | 📅 ${today}\n\n_No breaks recorded._`);
-  }
-
-  let list = '';
-  let totalSecs = 0;
-  let activeInfo = null;
-
-  for (const b of breaks) {
-    if (b.isActive) { activeInfo = b; continue; }
-    if (b.durSecs > 0) {
-      list += `• *${b.type}*: ${b.duration} (${b.start}-${b.end})`;
-      if (b.remark && !['AUTO-CLOSED'].includes(b.remark))
-        list += ` ⚠️ *${b.remark}*`;
+    if (b.duration_secs > 0) {
+      list += '• *' + b.break_type + '*: ' + b.duration_hms + ' (' + b.start_time + '-' + b.end_time + ')';
+      if (b.remark && b.remark !== 'AUTO-CLOSED')
+        list += ' ⚠️ *' + b.remark + '*';
       list += '\n';
-      totalSecs += b.durSecs;
+      totalSecs += b.duration_secs;
     }
   }
 
-  if (activeInfo) list = `🔴 *ACTIVE:* ${activeInfo.type} since ${activeInfo.start}\n\n${list}`;
+  if (activeInfo) list = '🔴 *ACTIVE:* ' + activeInfo.type + ' since ' + activeInfo.start + '\n\n' + list;
   if (!list) list = '_No completed breaks._\n';
 
-  const remain = allowance > 0 ? fmtRemaining(allowance - totalSecs) : 'N/A';
+  var remain = allowance > 0 ? fmtRemaining(allowance - totalSecs) : 'N/A';
   return sendMsg(chatId,
-    `👤 *${userName}* | ⏰ ${shiftType} | 📅 ${today}\n\n${list}\n⏱️ *Total:* ${fmtHMS(totalSecs)}\n⏳ *Remaining:* ${remain}`
+    '👤 *' + userName + '* | ⏰ ' + shiftType + ' | 📅 ' + today + '\n\n' + list + '\n⏱️ *Total:* ' + fmtHMS(totalSecs) + '\n⏳ *Remaining:* ' + remain
   );
 }
 
@@ -1354,125 +1007,91 @@ async function trackOverbreak(userName, userId, shiftType, shiftPeriod, breakTyp
 
 async function getDashboardData() {
   try {
-    const data = await readBreakData();
-    if (!data || data.length < 2) {
-      return { onBreak: [], dailySummary: [], breakHistory: [], violations: [], date: '' };
-    }
+    // Read from SQLite (instant, no network I/O)
+    var todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+    var activeBreaks = db.getAllActiveBreaks();
 
-    const phNow = toPH(new Date());
-    const todayStr = fmtDate(phNow, 'yyyy-MM-dd');
+    // Active breaks on dashboard
+    var onBreak = activeBreaks.map(function(b) {
+      return {
+        userName: b.user_name,
+        breakType: b.break_type,
+        startTime: b.start_time,
+        startTimestamp: getStartTimestamp(b.start_time)
+      };
+    }).filter(function(b) { return b.startTimestamp; })
+    .sort(function(a, b) { return (a.startTimestamp || 0) - (b.startTimestamp || 0); });
 
-    const onBreak = [];
-    const dailyMap = {};
-    const breakHistory = [];
-    const violations = [];
-    const userShiftMap = {};
-    const seenViolationUsers = {}; // Track unique users for violation dedup
+    // Time alerts for long active breaks
+    var now = Date.now();
+    var timeAlerts = onBreak
+      .filter(function(b) { return b.startTimestamp && (now - b.startTimestamp) > 3600000; })
+      .map(function(b) { return { userName: b.userName, message: b.breakType + ' since ' + b.startTime }; });
 
-    // First pass: shift info
-    for (let i = 1; i < data.length; i++) {
-      const userId = fmtCell(data[i][10]);
-      const shift = fmtCell(data[i][2]);
-      const period = fmtCell(data[i][3]);
-      const btype = fmtCell(data[i][4]);
-      const rowDate = data[i][0];
-      const userName = fmtCell(data[i][1]);
+    // Break history and daily summaries from SQLite
+    var breakHistory = [];
+    var violations = [];
+    var seenViolationUsers = {};
+    var dailyMap = {};
 
-      if (!userId || !rowDate || shift === 'RESET' || btype === 'SHIFT_SET') continue;
-      if (shift !== '8h' && shift !== '12h') continue;
-
-      const bd = getBusinessDate(parseDateCell(rowDate), period);
-      if (bd === todayStr) {
-        if (!userShiftMap[userId]) userShiftMap[userId] = { userName, shift, period };
-      }
-    }
-
-    // Second pass: breaks
-    for (let i = 1; i < data.length; i++) {
-      const userId = fmtCell(data[i][10]);
-      const userName = fmtCell(data[i][1]);
-      const shift = fmtCell(data[i][2]);
-      const period = fmtCell(data[i][3]);
-      const btype = fmtCell(data[i][4]);
-      const startRaw = data[i][5];
-      const endRaw = data[i][6];
-      const durRaw = data[i][7];
-      const remark = fmtCell(data[i][9]);
-      const rowDate = data[i][0];
-
-      if (!userId || !rowDate || shift === 'RESET' || btype === 'SHIFT_SET' || !btype) continue;
-
-      const bd = getBusinessDate(parseDateCell(rowDate), period);
-      if (bd !== todayStr) continue;
-      // Skip breaks with future start times
-      if (bd === todayStr) {
-        var stH = parseInt(parseTimeCell(startRaw).split(':')[0], 10);
-        var nH = new Date().getHours();
-        if (stH > nH + 1) continue;
-      }
-      const startTime = parseTimeCell(startRaw);
-      const endTime = endRaw ? parseTimeCell(endRaw) : '';
-      const durSecs = parseDur(durRaw);
-      const durStr = fmtHMS(durSecs);
-      const uInfo = userShiftMap[userId] || {};
-      const finalName = userName || uInfo.userName || 'Unknown';
-
-      // Active
-      if (!endTime && startTime) {
-        onBreak.push({ userName: finalName, breakType: btype, startTime, startTimestamp: getStartTimestamp(startTime) });
-      }
-
-      // Completed
-      if (endTime && durSecs > 0) {
-        breakHistory.push({ userName: finalName, type: btype, start: startTime, end: endTime, duration: durStr, remark });
-        if (remark === 'OVERBREAK' || remark === 'LONG BREAK') {
-          // Deduplicate: only one violation per staff member (keep highest severity)
-          var existingIdx = seenViolationUsers[finalName];
-          if (existingIdx === undefined) {
-            seenViolationUsers[finalName] = violations.length;
-            violations.push({ userName: finalName, type: btype, start: startTime, end: endTime, duration: durStr, remark });
-          } else if (remark === 'OVERBREAK' && violations[existingIdx].remark !== 'OVERBREAK') {
-            // Upgrade from LONG BREAK to OVERBREAK if higher severity
-            violations[existingIdx] = { userName: finalName, type: btype, start: startTime, end: endTime, duration: durStr, remark };
+    try {
+      var allBreaks = db.getTodayHistory('__ALL__');
+      if (allBreaks && allBreaks.length > 0) {
+        for (var i = 0; i < allBreaks.length; i++) {
+          var b = allBreaks[i];
+          if (b.status === 'ENDED' && b.duration_secs > 0) {
+            var remark = b.remark || '';
+            breakHistory.push({
+              userName: b.user_name, type: b.break_type,
+              start: b.start_time, end: b.end_time,
+              duration: b.duration_hms, remark: remark
+            });
+            if (remark === 'OVERBREAK' || remark === 'LONG BREAK') {
+              var eIdx = seenViolationUsers[b.user_name];
+              if (eIdx === undefined) {
+                seenViolationUsers[b.user_name] = violations.length;
+                violations.push({ userName: b.user_name, type: b.break_type, start: b.start_time, end: b.end_time, duration: b.duration_hms, remark: remark });
+              } else if (remark === 'OVERBREAK' && violations[eIdx].remark !== 'OVERBREAK') {
+                violations[eIdx] = { userName: b.user_name, type: b.break_type, start: b.start_time, end: b.end_time, duration: b.duration_hms, remark: remark };
+              }
+            }
+            var mk = b.user_id + '_' + (b.shift_type || '12h') + '_' + (b.shift_period || 'DayShift');
+            if (!dailyMap[mk]) {
+              dailyMap[mk] = {
+                userName: b.user_name, userId: b.user_id,
+                shift: (b.shift_type || '12h') + ' (' + (b.shift_period || 'DayShift') + ')',
+                totalSeconds: 0, allowanceSeconds: 7200
+              };
+            }
+            dailyMap[mk].totalSeconds += b.duration_secs;
           }
         }
       }
-
-      // Daily totals
-      if (durSecs > 0) {
-        var mapKey = userId + '_' + shift + '_' + period;
-      if (!dailyMap[mapKey]) {
-          dailyMap[mapKey] = {
-            userName: finalName, userId,
-            shift: `${shift}${period ? ' (' + period + ')' : ''}`,
-            totalSeconds: 0, allowanceSeconds: shift === '12h' ? 7200 : 5400
-          };
-        }
-        dailyMap[mapKey].totalSeconds += durSecs;
-        dailyMap[mapKey].userName = finalName;
-      }
+    } catch (dbErr) {
+      console.error('[BreakBot] Dashboard DB error:', dbErr.message);
     }
 
-    const dailySummary = Object.values(dailyMap).map(d => {
-      const remaining = d.allowanceSeconds - d.totalSeconds;
-      const isOver = d.totalSeconds > d.allowanceSeconds;
+    var dailySummary = Object.values(dailyMap).map(function(d) {
+      var remaining = d.allowanceSeconds - d.totalSeconds;
       return {
-        userName: d.userName, userId: d.userId, shift: d.shift,
-        used: fmtHMS(d.totalSeconds),
-        remaining: isOver ? '-' + fmtHMS(Math.abs(remaining)) : fmtHMS(remaining),
-        status: isOver ? 'Overbreak' : 'Good',
-        statusClass: isOver ? 'badge-critical' : 'badge-success',
-        statusIcon: isOver ? '⚠️' : '✅',
-        totalSeconds: d.totalSeconds, allowanceSeconds: d.allowanceSeconds
+        userName: d.userName, shift: d.shift,
+        totalUsed: fmtHMS(d.totalSeconds),
+        totalSeconds: d.totalSeconds,
+        totalAllowed: fmtHMS(d.allowanceSeconds),
+        remaining: remaining > 0
+          ? String(Math.floor(remaining / 3600)).padStart(2, '0') + 'h ' + String(Math.floor((remaining % 3600) / 60)).padStart(2, '0') + 'm'
+          : String(Math.floor(Math.abs(remaining) / 3600)).padStart(2, '0') + 'h ' + String(Math.floor((Math.abs(remaining) % 3600) / 60)).padStart(2, '0') + 'm',
+        overBreak: d.totalSeconds > d.allowanceSeconds
       };
     });
-    dailySummary.sort((a, b) => a.userName.localeCompare(b.userName));
 
     return {
-      onBreak,
-      dailySummary,
-      breakHistory: breakHistory.slice(-100).reverse(),
-      violations: violations.slice(-50).reverse(),
+      onBreak: onBreak,
+      dailySummary: dailySummary,
+      breakHistory: breakHistory,
+      violations: violations,
+      timeAlerts: timeAlerts,
+      violationHistory: violations,
       date: todayStr
     };
   } catch (err) {
@@ -1486,8 +1105,5 @@ module.exports = {
   getDashboardData,
   archiveOldData,
   startBreak,
-  endBreak,
-  writeEndBreakToSheet,
-  updateDailySummary,
-  activeBreakIndex
+  endBreak
 };

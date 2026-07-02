@@ -152,26 +152,33 @@ async function processBuffer(breakBotModule) {
  */
 async function replayStart(entry, bot) {
   var d = entry.data;
-  const { appendBreakRow, dateToSerial, timeToSerial } = require('./google');
+  const { breakAppendRow } = require('./google');
   const SH = CONFIG.breakSheetId;
 
-  var saved = await appendBreakRow(SH, 'CS BREAK!A:O', [
+  // breakAppendRow returns the raw Google API response:
+  // { spreadsheetId: "...", updates: { updatedRange: "CS BREAK!A369:O369", ... } }
+  // Extract the row number from updatedRange.
+  var result = await breakAppendRow(SH, 'CS BREAK!A:O', [
     d.bd, d.userName, d.shiftType, d.shiftPeriod, d.breakType, d.timeStr,
     '', '', '', '', d.userId, '', '🔴 ON BREAK', d.breakId, '🔴 ON BREAK'
   ]);
 
-  if (saved && saved.ok && saved.row) {
-    // Update the active break index with the real row number
-    if (bot && bot.activeBreakIndex) {
-      bot.activeBreakIndex.set(String(d.userId), {
-        row: saved.row,
-        data: [dateToSerial(d.bd), d.userName, d.shiftType, d.shiftPeriod, d.breakType,
-               timeToSerial(d.timeStr), '', '', '', '', d.userId, '', '🔴 ON BREAK', d.breakId, '🔴 ON BREAK']
-      });
+  if (result && result.updates && result.updates.updatedRange) {
+    var range = result.updates.updatedRange;
+    var match = range.match(/A(\d+):/);
+    var row = match ? parseInt(match[1], 10) : 0;
+    if (row > 0) {
+      if (bot && bot.activeBreakIndex) {
+        bot.activeBreakIndex.set(String(d.userId), {
+          row: row,
+          data: [d.bd, d.userName, d.shiftType, d.shiftPeriod, d.breakType,
+                 d.timeStr, '', '', '', '', d.userId, '', '🔴 ON BREAK', d.breakId, '🔴 ON BREAK']
+        });
+      }
+      return true;
     }
-    return true;
   }
-  throw new Error('appendBreakRow returned ok:false');
+  throw new Error('breakAppendRow failed');
 }
 
 /**

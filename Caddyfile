@@ -1,0 +1,32 @@
+vps-faf8418b.vps.ovh.net {
+	reverse_proxy localhost:8000
+
+	handle_path /qc-point/* {
+		reverse_proxy localhost:3003
+	}
+
+	handle /webhook-break* {
+		reverse_proxy localhost:3004
+	}
+
+	handle /api/break-tracker* {
+		reverse_proxy localhost:3004
+	}
+
+	handle /api/breaks/dashboard* {
+		reverse_proxy localhost:3004
+	}
+}
+
+lionyy.shop {
+	encode gzip
+
+	handle_path /viber-device/* {
+		basicauth {
+			viberdesk $2a$14$uHoSkGRSNkTlYczpzZTsEui0C8dgUJfxe1ngmo2PAABK3bEKftu16
+		}
+		reverse_proxy 127.0.0.1:6080
+	}
+
+	reverse_proxy 127.0.0.1:3000
+}

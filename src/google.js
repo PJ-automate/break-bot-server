@@ -89,7 +89,7 @@ function acquireReadSlot(spreadsheetId) {
       q = { sem: 0, queue: [] };
       readQueues[spreadsheetId] = q;
     }
-    if (q.sem < 3) {
+    if (q.sem < 5) {
       q.sem++;
       resolve();
     } else {
@@ -108,7 +108,7 @@ function releaseReadSlot(spreadsheetId) {
   }
 }
 
-const GOOGLE_API_TIMEOUT = 25000;
+const GOOGLE_API_TIMEOUT = 40000; // 40s — OVH France has high latency to Google APIs
 
 function timeoutPromise(ms) {
   return new Promise(function(_, reject) {

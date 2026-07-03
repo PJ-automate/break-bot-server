@@ -7,7 +7,7 @@
 
 const db = require('./break-db');
 const CONFIG = require('./config');
-const { breakAppendRow, breakUpdateRange, updateRange, getBreakSheetId, reapplyBreakNumberFormats } = require('./google');
+const { breakAppendRow, breakUpdateRange, updateRange, getOrCreateSheet, formatDate, getBreakSheetId, reapplyBreakNumberFormats } = require('./google');
 
 const SYNC_TIMEOUT = 90000; // 90s — OVH France has high latency to Google APIs
 var processing = false;
@@ -129,6 +129,13 @@ async function processSyncQueue() {
         }
         db.markSyncDone(item.id, item.sq_break_id, item.google_sheet_row || 0);
         console.log('[SyncWorker] Synced ' + item.operation + ' #' + item.break_id);
+
+        // After end break sync: check if violation (LONG BREAK or OVERBREAK) and write to OVERBREAK_TRACKER
+        if (item.operation === 'end' && (item.remark === 'LONG BREAK' || item.remark === 'OVERBREAK')) {
+          trackOverbreakViolation(item).catch(function(err) {
+            console.warn('[SyncWorker] Overbreak tracking error (non-blocking):', err.message);
+          });
+        }
       } catch (err) {
         db.markSyncFailed(item.id, err.message);
         console.warn('[SyncWorker] Failed ' + item.operation + ' #' + item.break_id + ': ' + err.message);
@@ -257,6 +264,40 @@ function timeStringToSerial(timeStr) {
   if (!timeStr || !timeStr.includes(':')) return 0;
   var parts = timeStr.split(':').map(Number);
   return ((parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0)) / 86400;
+}
+
+/**
+ * Track overbreak violations to OVERBREAK_TRACKER sheet.
+ * Called after an end-break sync completes when remark is LONG BREAK or OVERBREAK.
+ * Writes: Date, User Name, User ID, Shift, Period, Break Type (+violation type),
+ *         Time Range, Duration, Total Break Used
+ */
+async function trackOverbreakViolation(item) {
+  try {
+    // Ensure OVERBREAK_TRACKER sheet exists
+    await getOrCreateSheet(SH, 'OVERBREAK_TRACKER');
+
+    var now = new Date();
+    var dateStr = formatDate(now, 'yyyy-MM-dd HH:mm:ss');
+    var startEnd = (item.start_time || '') + ' → ' + (item.end_time || '');
+    var violationLabel = item.remark === 'OVERBREAK' ? 'OVERBREAK' : 'LONG BREAK';
+
+    await breakAppendRow(SH, 'OVERBREAK_TRACKER!A:I', [
+      dateStr,
+      item.user_name || '',
+      item.user_id || '',
+      item.shift_type || '',
+      item.shift_period || '',
+      (item.break_type || '') + ' (' + violationLabel + ')',
+      startEnd,
+      item.duration_hms || '',
+      item.total_used_hms || ''
+    ]);
+    console.log('[SyncWorker] Violation tracked to OVERBREAK_TRACKER: ' + violationLabel + ' for ' + item.user_name);
+  } catch (err) {
+    // Non-critical — don't let it affect the main sync flow
+    console.warn('[SyncWorker] trackOverbreakViolation failed:', err.message);
+  }
 }
 
 /**

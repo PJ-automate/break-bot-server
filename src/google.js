@@ -669,7 +669,7 @@ async function formatOverbreakSheet(ss, spreadsheetId, sheetId) {
   };
   requests.push({
     repeatCell: {
-      range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 8 },
+      range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 9 },
       cell: { userEnteredFormat: hdrFmt },
       fields: 'userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)'
     }
@@ -682,19 +682,20 @@ async function formatOverbreakSheet(ss, spreadsheetId, sheetId) {
     }
   });
 
-  const existing = await readRange(spreadsheetId, 'OVERBREAK_TRACKER!A1:H1');
+  const existing = await readRange(spreadsheetId, 'OVERBREAK_TRACKER!A1:I1');
   if (!existing || existing.length === 0 || !existing[0][0]) {
-    await updateRange(spreadsheetId, 'OVERBREAK_TRACKER!A1:H1', [[
+    await updateRange(spreadsheetId, 'OVERBREAK_TRACKER!A1:I1', [[
       'Date', 'User Name', 'User ID', 'Shift', 'Period', 'Break Type',
-      'Time (Start → End)', 'Duration'
+      'Time (Start → End)', 'Duration', 'Total Break Used'
     ]]);
   }
 
   const colWidths = [
     { col: 0, w: 110 }, { col: 1, w: 180 },
     { col: 2, w: 120 }, { col: 3, w: 80 },
-    { col: 4, w: 110 }, { col: 5, w: 110 },
+    { col: 4, w: 110 }, { col: 5, w: 130 },
     { col: 6, w: 170 }, { col: 7, w: 90 },
+    { col: 8, w: 130 },
   ];
   for (const { col, w } of colWidths) {
     requests.push({
@@ -708,7 +709,7 @@ async function formatOverbreakSheet(ss, spreadsheetId, sheetId) {
   const borderGray = { red: 0.8, green: 0.8, blue: 0.8 };
   requests.push({
     updateBorders: {
-      range: { sheetId, startRowIndex: 0, endRowIndex: 2000, startColumnIndex: 0, endColumnIndex: 8 },
+      range: { sheetId, startRowIndex: 0, endRowIndex: 2000, startColumnIndex: 0, endColumnIndex: 9 },
       top: { style: 'SOLID', color: borderGray },
       bottom: { style: 'SOLID', color: borderGray },
       left: { style: 'SOLID', color: borderGray },
@@ -720,7 +721,7 @@ async function formatOverbreakSheet(ss, spreadsheetId, sheetId) {
 
   requests.push({
     repeatCell: {
-      range: { sheetId, startRowIndex: 1, endRowIndex: 2000, startColumnIndex: 0, endColumnIndex: 8 },
+      range: { sheetId, startRowIndex: 1, endRowIndex: 2000, startColumnIndex: 0, endColumnIndex: 9 },
       cell: {
         userEnteredFormat: {
           backgroundColor: { red: 1, green: 1, blue: 1 },
@@ -732,22 +733,59 @@ async function formatOverbreakSheet(ss, spreadsheetId, sheetId) {
     }
   });
 
-  const altGray = { red: 242/255, green: 242/255, blue: 242/255 };
+  // --- CONDITIONAL FORMATTING (priority order) ---
+
+  // Rule 1 (highest): OVERBREAK — Total Break Used > 2 hours → RED highlight
   requests.push({
     addConditionalFormatRule: {
       rule: {
-        ranges: [{ sheetId, startRowIndex: 1, endRowIndex: 2000, startColumnIndex: 0, endColumnIndex: 8 }],
+        ranges: [{ sheetId, startRowIndex: 1, endRowIndex: 2000, startColumnIndex: 0, endColumnIndex: 9 }],
         booleanRule: {
-          condition: { type: 'CUSTOM_FORMULA', values: [{ userEnteredValue: '=MOD(ROW(),2)=0' }] },
-          format: { backgroundColor: altGray }
+          condition: { type: 'CUSTOM_FORMULA', values: [{ userEnteredValue: '=AND($I2<>"", $I2<>"Total Break Used", VALUE($I2)>2/24)' }] },
+          format: {
+            backgroundColor: { red: 217/255, green: 83/255, blue: 79/255 },
+            textFormat: { bold: true, foregroundColor: { red: 1, green: 1, blue: 1 } }
+          }
         }
       },
       index: 0
     }
   });
 
+  // Rule 2: LONG BREAK — Duration > 1 hour → ORANGE highlight
+  requests.push({
+    addConditionalFormatRule: {
+      rule: {
+        ranges: [{ sheetId, startRowIndex: 1, endRowIndex: 2000, startColumnIndex: 0, endColumnIndex: 9 }],
+        booleanRule: {
+          condition: { type: 'CUSTOM_FORMULA', values: [{ userEnteredValue: '=AND($H2<>"", $H2<>"Duration", VALUE($H2)>1/24)' }] },
+          format: {
+            backgroundColor: { red: 252/255, green: 185/255, blue: 35/255 },
+            textFormat: { bold: true }
+          }
+        }
+      },
+      index: 1
+    }
+  });
+
+  // Rule 3 (lowest): Alternating row colors
+  const altGray = { red: 242/255, green: 242/255, blue: 242/255 };
+  requests.push({
+    addConditionalFormatRule: {
+      rule: {
+        ranges: [{ sheetId, startRowIndex: 1, endRowIndex: 2000, startColumnIndex: 0, endColumnIndex: 9 }],
+        booleanRule: {
+          condition: { type: 'CUSTOM_FORMULA', values: [{ userEnteredValue: '=AND(MOD(ROW(),2)=0, NOT(VALUE($I2)>2/24))' }] },
+          format: { backgroundColor: altGray }
+        }
+      },
+      index: 2
+    }
+  });
+
   await ss.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } });
-  console.log('[Format] OVERBREAK_TRACKER formatted');
+  console.log('[Format] OVERBREAK_TRACKER formatted (9 cols + LONG BREAK/OVERBREAK highlights)');
 }
 
 // ============================================================

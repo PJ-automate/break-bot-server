@@ -224,7 +224,131 @@ async function runArchive() {
     console.error('[ArchiveWorker] Archive error:', err.message);
   }
 
+  // After archive: clean up old records from DAILY SUMMARY (30-day) and Archives (1-month)
+  try { await cleanupDailySummary(ssId); } catch(e) { console.error('[ArchiveWorker] Daily summary cleanup error:', e.message); }
+  try { await cleanupArchives(ssId); } catch(e) { console.error('[ArchiveWorker] Archives cleanup error:', e.message); }
+
   running = false;
+}
+
+/**
+ * Get date string N days ago in PH timezone as YYYY-MM-DD.
+ */
+function getDateDaysAgo(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+}
+
+/**
+ * Delete excess rows from a sheet after rewriting (reduces grid size).
+ */
+async function deleteExcessRows(ssId, sheetName, keepCount) {
+  try {
+    const { google } = require("googleapis");
+    const key = require(CONFIG.breakServiceAccountPath);
+    const auth = new google.auth.GoogleAuth({ credentials: key, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
+    const gsheets = google.sheets({ version: "v4", auth });
+    const ssInfo = await gsheets.spreadsheets.get({ spreadsheetId: ssId });
+    const sheet = ssInfo.data.sheets.find(function(s) { return s.properties.title === sheetName; });
+    if (sheet) {
+      const totalRows = sheet.properties.gridProperties.rowCount || 1000;
+      if (keepCount < totalRows) {
+        await gsheets.spreadsheets.batchUpdate({
+          spreadsheetId: ssId,
+          requestBody: {
+            requests: [{
+              deleteDimension: {
+                range: { sheetId: sheet.properties.sheetId, dimension: "ROWS", startIndex: keepCount, endIndex: totalRows }
+              }
+            }]
+          }
+        });
+        console.log("[ArchiveWorker] Deleted " + (totalRows - keepCount) + " excess rows from " + sheetName);
+      }
+    }
+  } catch(e) {
+    console.warn("[ArchiveWorker] " + sheetName + " row cleanup warning:", e.message);
+  }
+}
+
+/**
+ * Clean up DAILY SUMMARY — keep only last 30 days of data.
+ * Deletes rows where date is older than 30 days from today (PH time).
+ */
+async function cleanupDailySummary(ssId) {
+  try {
+    const data = await readRange(ssId, 'DAILY SUMMARY!A:E');
+    if (!data || data.length < 2) return 0;
+
+    const cutoffDate = getDateDaysAgo(30);
+    const header = data[0];
+    const rowsToKeep = [header];
+    let deletedCount = 0;
+
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      if (!row[0]) { rowsToKeep.push(row); continue; }
+      let rowDateStr = String(row[0]).trim();
+      const dateMatch = rowDateStr.match(/(\d{4}-\d{2}-\d{2})/);
+      if (dateMatch) rowDateStr = dateMatch[1];
+      if (rowDateStr >= cutoffDate) {
+        rowsToKeep.push(row);
+      } else {
+        deletedCount++;
+      }
+    }
+
+    if (deletedCount === 0) return 0;
+
+    await updateRange(ssId, "'DAILY SUMMARY'!A1:E" + rowsToKeep.length, rowsToKeep);
+    await deleteExcessRows(ssId, 'DAILY SUMMARY', rowsToKeep.length);
+    console.log('[ArchiveWorker] ✅ DAILY SUMMARY cleanup: removed ' + deletedCount + ' rows older than ' + cutoffDate);
+    return deletedCount;
+  } catch (err) {
+    console.error('[ArchiveWorker] DAILY SUMMARY cleanup error:', err.message);
+    return 0;
+  }
+}
+
+/**
+ * Clean up Archives — keep only last 1 month of data.
+ * Deletes rows where date is older than 30 days from today (PH time).
+ */
+async function cleanupArchives(ssId) {
+  try {
+    const data = await readRange(ssId, "'Archives'!A:O");
+    if (!data || data.length < 2) return 0;
+
+    const cutoffDate = getDateDaysAgo(30);
+    const header = data[0];
+    const rowsToKeep = [header];
+    let deletedCount = 0;
+
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      if (!row[0]) { rowsToKeep.push(row); continue; }
+      let rowDateStr = String(row[0]).trim();
+      const dateMatch = rowDateStr.match(/(\d{4}-\d{2}-\d{2})/);
+      if (dateMatch) rowDateStr = dateMatch[1];
+      if (rowDateStr >= cutoffDate) {
+        rowsToKeep.push(row);
+      } else {
+        deletedCount++;
+      }
+    }
+
+    if (deletedCount === 0) return 0;
+
+    await ensureArchiveGrid(ssId, rowsToKeep.length + 5);
+    await updateRange(ssId, "'Archives'!A1:O" + rowsToKeep.length, rowsToKeep);
+    await deleteExcessRows(ssId, 'Archives', rowsToKeep.length);
+    console.log('[ArchiveWorker] ✅ Archives cleanup: removed ' + deletedCount + ' rows older than ' + cutoffDate);
+    return deletedCount;
+  } catch (err) {
+    console.error('[ArchiveWorker] Archives cleanup error:', err.message);
+    return 0;
+  }
 }
 
 /**
@@ -273,5 +397,7 @@ function startArchiveWorker(intervalMs) {
 module.exports = {
   startArchiveWorker,
   runArchive,
-  getPHDateStr
+  getPHDateStr,
+  cleanupDailySummary,
+  cleanupArchives
 };

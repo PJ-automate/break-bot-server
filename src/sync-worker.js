@@ -1,7 +1,9 @@
-/**
+﻿/**
  * sync-worker.js — Background Google Sheet sync for Break Tracker.
  * Reads pending syncs from SQLite and pushes to Google Sheets.
  * Runs in background — never blocks user commands.
+ *
+ * FIXED July 2026: Handle "exceeds grid limits" error from archive resizing
  */
 'use strict';
 
@@ -83,7 +85,6 @@ async function processSyncQueue() {
                     item.google_sheet_row = newRow;
                     db.getDB().prepare('UPDATE breaks SET google_sheet_row = ? WHERE id = ?').run(newRow, item.sq_break_id);
                     console.log('[SyncWorker] End break appended as new row ' + newRow + ' for #' + item.break_id);
-                    // Complete row has ALL data — mark done immediately to prevent retry loop
                     db.markSyncDone(item.id, item.sq_break_id, newRow);
                     // Fire-and-forget daily summary update
                     setTimeout(function() {
@@ -111,7 +112,7 @@ async function processSyncQueue() {
                 }
               } catch (appendErr) {
                 console.warn('[SyncWorker] End fallback append failed for #' + item.break_id + ': ' + appendErr.message);
-                continue; // Will retry on next cycle
+                continue;
               }
             } else {
               console.log('[SyncWorker] End #' + item.break_id + ' has no break record, skipping');
@@ -139,6 +140,15 @@ async function processSyncQueue() {
       } catch (err) {
         db.markSyncFailed(item.id, err.message);
         console.warn('[SyncWorker] Failed ' + item.operation + ' #' + item.break_id + ': ' + err.message);
+
+        // If the sheet row was deleted by archive, reset google_sheet_row so next retry re-appends
+        if (err.message && err.message.indexOf('exceeds grid limits') >= 0) {
+          try {
+            db.getDB().prepare('UPDATE breaks SET google_sheet_row = 0 WHERE id = ?').run(item.sq_break_id);
+            console.log('[SyncWorker] Reset google_sheet_row for #' + item.break_id + ' (grid limits after archive)');
+          } catch(e) {}
+        }
+
         // Don't stop — continue to next item (each sync is independent)
       }
     }
@@ -318,3 +328,4 @@ module.exports = {
   processSyncQueue,
   startSyncWorker
 };
+

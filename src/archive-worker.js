@@ -1,14 +1,18 @@
-/**
+﻿/**
  * archive-worker.js — Automatically archives old break data from CS BREAK sheet
  * to ARCHIVE sheet after midnight. Runs on a scheduled interval.
  *
- * Works alongside the Google Apps Script autoArchiveOldBreaks() for redundancy.
- * This Node.js version handles the case when the Apps Script trigger fails.
+ * FIXED July 2026:
+ *  - Serial number dates handled correctly (not just YYYY-MM-DD strings)
+ *  - All CS BREAK writes use RAW input to prevent date-to-serial conversion
+ *  - Off-by-one error in Archives append fixed
+ *  - ssId scope bug in cleanup calls fixed
+ *  - Same date comparison fix applied to cleanupDailySummary and cleanupArchives
  */
 'use strict';
 
 const CONFIG = require('./config');
-const { readRange, getOrCreateSheet, updateRange, breakBatchUpdate, formatBreakSheets } = require('./google');
+const { readRange, getOrCreateSheet, updateRange, breakUpdateRange, breakBatchUpdate, formatBreakSheets } = require('./google');
 const { google } = require("googleapis");
 const key = require(CONFIG.breakServiceAccountPath);
 
@@ -81,6 +85,64 @@ function getPHTimeComponents() {
 }
 
 /**
+ * Convert a Google Sheets cell value to a YYYY-MM-DD date string.
+ * Handles:
+ *  - Date strings already in YYYY-MM-DD format ("2026-07-04")
+ *  - Google Sheets serial numbers (46207 = July 4, 2026)
+ *  - Date strings in other formats (parseable by Date constructor)
+ *  - Empty/null values (returns empty string)
+ *
+ * Google Sheets stores dates as serial numbers: days since Dec 30, 1899.
+ * Serial 46207 = July 4, 2026 (46207 days after Dec 30, 1899).
+ * The conversion formula: Date = (serial - 25569) * 86400000 ms.
+ */
+function cellToDateStr(value) {
+  if (value === null || value === undefined || value === '') return '';
+
+  // Case 1: Already a YYYY-MM-DD string — fast path
+  var str = String(value).trim();
+  var match = str.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (match) return match[1];
+
+  // Case 2: Google Sheets serial number (stored as number or numeric string)
+  var num = Number(value);
+  if (!isNaN(num) && Number.isFinite(num)) {
+    // Sanity check: valid serial dates are in a known range
+    // Serial 40000 ≈ June 2009, 55000 ≈ August 2050
+    if (num > 40000 && num < 55000) {
+      // Excel/Sheets epoch: Dec 30, 1899 = serial 0
+      // Unix epoch: Jan 1, 1970 = serial 25569
+      var d = new Date((num - 25569) * 86400000);
+      return d.toISOString().substring(0, 10);
+    }
+    // Also handle smaller serials (time-only values or near-epoch)
+    if (num > 0 && num < 1) return ''; // time-only value, skip
+  }
+
+  // Case 3: Try parsing as a generic date string
+  var parsed = new Date(str);
+  if (!isNaN(parsed.getTime())) {
+    return parsed.toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+  }
+
+  return str; // fallback — return as-is
+}
+
+/**
+ * Normalize the date column (index 0) in a 2D array of rows to YYYY-MM-DD strings.
+ * Mutates rows in-place and returns the array for chaining.
+ */
+function normalizeDates(rows) {
+  if (!rows || rows.length === 0) return rows;
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i] && rows[i][0]) {
+      rows[i][0] = cellToDateStr(rows[i][0]);
+    }
+  }
+  return rows;
+}
+
+/**
  * Archive old data from CS BREAK sheet to ARCHIVE sheet.
  * Moves any rows whose date is before today's PH date.
  */
@@ -88,8 +150,10 @@ async function runArchive() {
   if (running) return;
   running = true;
 
+  // ssId declared HERE (outside try) so cleanup calls below can access it
+  const ssId = CONFIG.breakSheetId;
+
   try {
-    const ssId = CONFIG.breakSheetId;
     if (!ssId) throw new Error('breakSheetId not configured');
 
     const todayStr = getPHDateStr();
@@ -115,15 +179,13 @@ async function runArchive() {
     const rowsToMove = [];
     const rowsToKeep = [data[0]]; // Header row stays
 
-    for (let i = 1; i < data.length; i++) {
-      const row = data[i];
-      if (!row[0]) { rowsToKeep.push(row); continue; } // No date = keep
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      if (!row || !row[0]) { rowsToKeep.push(row); continue; } // No date = keep
 
-      // Parse the row's date
-      let rowDateStr = String(row[0]).trim();
-      // Extract just YYYY-MM-DD if it contains more
-      const dateMatch = rowDateStr.match(/(\d{4}-\d{2}-\d{2})/);
-      if (dateMatch) rowDateStr = dateMatch[1];
+      // Normalize date to YYYY-MM-DD for comparison
+      var rowDateStr = cellToDateStr(row[0]);
+      if (!rowDateStr) { rowsToKeep.push(row); continue; } // Unparseable = keep
 
       // Compare: if row date is before today, archive it
       if (rowDateStr < todayStr) {
@@ -140,7 +202,6 @@ async function runArchive() {
       return;
     }
 
-    // Use the professionally formatted "Archives" sheet (with purple header, borders, alternating colors)
     console.log('[ArchiveWorker] Moving ' + rowsToMove.length + ' rows to Archives...');
 
     // Ensure Archives sheet exists
@@ -148,46 +209,66 @@ async function runArchive() {
 
     // Get existing Archives data to know where to append
     const existingArchive = await readRange(ssId, "'Archives'!A:O");
-    const archiveStartRow = existingArchive && existingArchive.length > 0
-      ? existingArchive.length + 1
-      : 1;
+
+    // Normalize dates in both datasets before writing
+    normalizeDates(rowsToMove);
+    normalizeDates(rowsToKeep);
+
+    // Determine append position in Archives
+    var archiveAppendRow = 1;
+    if (existingArchive && existingArchive.length > 0) {
+      archiveAppendRow = existingArchive.length + 1;
+    }
+
+    // Calculate final row position and expand grid if needed
+    var lastNeed = archiveAppendRow - 1 + rowsToMove.length;
+    if (!existingArchive || existingArchive.length === 0) {
+      lastNeed = 1 + rowsToMove.length;
+    }
+    await ensureArchiveGrid(ssId, lastNeed + 5);
 
     // Mark as archived BEFORE write to prevent duplicate 15-min runs
     lastArchivedDate = todayStr;
 
-    // Calculate final row position and expand grid if needed
-    const lastNeed = existingArchive && existingArchive.length > 0
-      ? archiveStartRow - 1 + rowsToMove.length
-      : 1 + rowsToMove.length;
-    await ensureArchiveGrid(ssId, lastNeed + 5);
-
-    // If Archives is empty, write header first
+    // Write to Archives sheet
     if (!existingArchive || existingArchive.length === 0) {
+      // Archives is empty — write header + data rows
       await updateRange(ssId, "'Archives'!A1", [data[0]]);
-      await updateRange(ssId, "'Archives'!A2:O" + (rowsToMove.length + 1), rowsToMove);
+      var endRow = 1 + rowsToMove.length;
+      await breakUpdateRange(ssId, "'Archives'!A2:O" + endRow, rowsToMove);
+      console.log('[ArchiveWorker] Wrote header + ' + rowsToMove.length + ' data rows to Archives (A1:O' + endRow + ')');
     } else {
-      await updateRange(ssId, "'Archives'!A" + (archiveStartRow + 1) + ":O" + (archiveStartRow + rowsToMove.length), rowsToMove);
+      // Archives has data — append after the last existing row
+      var startRow = archiveAppendRow;
+      var endRow = archiveAppendRow + rowsToMove.length - 1;
+      await breakUpdateRange(ssId, "'Archives'!A" + startRow + ":O" + endRow, rowsToMove);
+      console.log('[ArchiveWorker] Appended ' + rowsToMove.length + ' rows to Archives (A' + startRow + ':O' + endRow + ')');
     }
 
     // Rewrite CS BREAK sheet with only today's data
+    // IMPORTANT: Use breakUpdateRange (RAW input) to prevent Google Sheets
+    // from auto-converting date strings to serial numbers (which would
+    // break future archive comparisons).
     if (rowsToKeep.length > 0) {
-      await updateRange(ssId, "'CS BREAK'!A1:O" + rowsToKeep.length, rowsToKeep);
+      await breakUpdateRange(ssId, "'CS BREAK'!A1:O" + rowsToKeep.length, rowsToKeep);
+      console.log('[ArchiveWorker] Rewrote CS BREAK with ' + rowsToKeep.length + ' rows (RAW mode)');
 
       // Delete rows beyond what we wrote (cleaner than writing empties)
-      // Uses a single API call to remove all excess rows below the kept data.
       try {
-        // We need to find the sheet grid extents to know how far to delete
-        const { google } = require("googleapis");
-        const key = require(CONFIG.breakServiceAccountPath);
-        const auth = new google.auth.GoogleAuth({ credentials: key, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
-        const gsheets = google.sheets({ version: "v4", auth });
-        const ssInfo = await gsheets.spreadsheets.get({ spreadsheetId: ssId });
-        const csSheet = ssInfo.data.sheets.find(function(s) { return s.properties.title === "CS BREAK"; });
+        var gsheets2 = google.sheets({
+          version: "v4",
+          auth: new google.auth.GoogleAuth({
+            credentials: key,
+            scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+          })
+        });
+        var ssInfo = await gsheets2.spreadsheets.get({ spreadsheetId: ssId });
+        var csSheet = ssInfo.data.sheets.find(function(s) { return s.properties.title === "CS BREAK"; });
         if (csSheet) {
-          const totalRows = csSheet.properties.gridProperties.rowCount || 1000;
-          const rowsToDelete = totalRows - rowsToKeep.length;
+          var totalRows = csSheet.properties.gridProperties.rowCount || 1000;
+          var rowsToDelete = totalRows - rowsToKeep.length;
           if (rowsToDelete > 0 && rowsToKeep.length < totalRows) {
-            await gsheets.spreadsheets.batchUpdate({
+            await gsheets2.spreadsheets.batchUpdate({
               spreadsheetId: ssId,
               requestBody: {
                 requests: [{
@@ -217,7 +298,6 @@ async function runArchive() {
       console.warn('[ArchiveWorker] Formatting error (non-fatal):', fmtErr.message);
     }
 
-    lastArchivedDate = todayStr;
     console.log('[ArchiveWorker] ✅ Archived ' + rowsToMove.length + ' rows into Archives. CS BREAK now has ' + rowsToKeep.length + ' rows.');
 
   } catch (err) {
@@ -225,6 +305,7 @@ async function runArchive() {
   }
 
   // After archive: clean up old records from DAILY SUMMARY (30-day) and Archives (1-month)
+  // ssId is accessible here because it was declared outside the try block
   try { await cleanupDailySummary(ssId); } catch(e) { console.error('[ArchiveWorker] Daily summary cleanup error:', e.message); }
   try { await cleanupArchives(ssId); } catch(e) { console.error('[ArchiveWorker] Archives cleanup error:', e.message); }
 
@@ -288,10 +369,9 @@ async function cleanupDailySummary(ssId) {
 
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
-      if (!row[0]) { rowsToKeep.push(row); continue; }
-      let rowDateStr = String(row[0]).trim();
-      const dateMatch = rowDateStr.match(/(\d{4}-\d{2}-\d{2})/);
-      if (dateMatch) rowDateStr = dateMatch[1];
+      if (!row || !row[0]) { rowsToKeep.push(row); continue; }
+      const rowDateStr = cellToDateStr(row[0]);
+      if (!rowDateStr) { rowsToKeep.push(row); continue; }
       if (rowDateStr >= cutoffDate) {
         rowsToKeep.push(row);
       } else {
@@ -301,6 +381,7 @@ async function cleanupDailySummary(ssId) {
 
     if (deletedCount === 0) return 0;
 
+    normalizeDates(rowsToKeep);
     await updateRange(ssId, "'DAILY SUMMARY'!A1:E" + rowsToKeep.length, rowsToKeep);
     await deleteExcessRows(ssId, 'DAILY SUMMARY', rowsToKeep.length);
     console.log('[ArchiveWorker] ✅ DAILY SUMMARY cleanup: removed ' + deletedCount + ' rows older than ' + cutoffDate);
@@ -327,10 +408,9 @@ async function cleanupArchives(ssId) {
 
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
-      if (!row[0]) { rowsToKeep.push(row); continue; }
-      let rowDateStr = String(row[0]).trim();
-      const dateMatch = rowDateStr.match(/(\d{4}-\d{2}-\d{2})/);
-      if (dateMatch) rowDateStr = dateMatch[1];
+      if (!row || !row[0]) { rowsToKeep.push(row); continue; }
+      const rowDateStr = cellToDateStr(row[0]);
+      if (!rowDateStr) { rowsToKeep.push(row); continue; }
       if (rowDateStr >= cutoffDate) {
         rowsToKeep.push(row);
       } else {
@@ -340,6 +420,7 @@ async function cleanupArchives(ssId) {
 
     if (deletedCount === 0) return 0;
 
+    normalizeDates(rowsToKeep);
     await ensureArchiveGrid(ssId, rowsToKeep.length + 5);
     await updateRange(ssId, "'Archives'!A1:O" + rowsToKeep.length, rowsToKeep);
     await deleteExcessRows(ssId, 'Archives', rowsToKeep.length);
@@ -401,3 +482,4 @@ module.exports = {
   cleanupDailySummary,
   cleanupArchives
 };
+

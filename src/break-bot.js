@@ -289,6 +289,18 @@ async function archiveOldData() {
   }
 }
 
+/**
+ * Race a promise against a timeout.
+ */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise(function(_, reject) {
+      setTimeout(function() { reject(new Error(label + ' timed out (' + ms + 'ms)')); }, ms);
+    })
+  ]);
+}
+
 // ============================================================
 //  TELEGRAM API HELPERS
 // ============================================================
@@ -908,26 +920,45 @@ async function endBreak(chatId, userId, userName) {
 // ============================================================
 
 async function updateDailySummary(date, user, shift, period, totalUsed, remaining) {
-  const data = await readSummaryData();
-  let rowIndex = -1;
-  if (data) {
-    for (let i = 1; i < data.length; i++) {
-      const rd = data[i][0] instanceof Date ? fmtDate(data[i][0], 'yyyy-MM-dd') : fmtCell(data[i][0]);
-      if (rd === date && fmtCell(data[i][1]) === user && fmtCell(data[i][2]) === shift + " (" + period + ")") {
-        rowIndex = i + 1;
-        break;
-      }
+  var shiftKey = shift + ' (' + period + ')';
+
+  // PHASE 1: Check SQLite cache — instant, no network I/O
+  var cached = db.getSummaryCache(date, user, shiftKey);
+  if (cached && cached.sheet_row > 0) {
+    try {
+      await withTimeout(breakUpdateRange(SH, 'DAILY SUMMARY!C' + cached.sheet_row + ':E' + cached.sheet_row, [[
+        shiftKey, timeToSerial(totalUsed), remaining
+      ]]), 60000, 'breakUpdateRange DS');
+      db.setSummaryCache(date, user, shiftKey, cached.sheet_row, totalUsed, remaining);
+      console.log('[DS] Updated existing row ' + cached.sheet_row + ' for ' + user);
+      return;
+    } catch (err) {
+      console.warn('[DS] Cached update failed for ' + user + ': ' + err.message + ' — will append');
     }
   }
 
-  if (rowIndex !== -1) {
-    await breakUpdateRange(SH, `DAILY SUMMARY!C${rowIndex}:E${rowIndex}`, [[
-      `${shift} (${period})`, timeToSerial(totalUsed), remaining
-    ]]);
-  } else {
-    await breakAppendRow(SH, 'DAILY SUMMARY!A:E', [
-      dateToSerial(date), user, `${shift} (${period})`, timeToSerial(totalUsed), remaining
-    ]);
+  // PHASE 2: No cache or update failed — append new row directly
+  // Note: We do NOT read the sheet to find existing rows (that causes 90s timeouts).
+  // Since the cache is rebuilt after every archive, missing cache = new row needed.
+  // If a duplicate is created (rare race condition), it will be merged on next archive.
+  try {
+    var appendResult = await withTimeout(breakAppendRow(SH, 'DAILY SUMMARY!A:E', [
+      dateToSerial(date), user, shiftKey, timeToSerial(totalUsed), remaining
+    ]), 120000, 'breakAppendRow DS');
+    if (appendResult && appendResult.updates && appendResult.updates.updatedRange) {
+      var match = appendResult.updates.updatedRange.match(/A(\d+):/);
+      var newRow = match ? parseInt(match[1], 10) : 0;
+      if (newRow > 0) {
+        db.setSummaryCache(date, user, shiftKey, newRow, totalUsed, remaining);
+        console.log('[DS] Appended new row ' + newRow + ' for ' + user);
+        return;
+      }
+    }
+    console.log('[DS] Append completed for ' + user + ' but could not determine row');
+  } catch (err) {
+    console.warn('[DS] Append failed for ' + user + ': ' + err.message);
+    // Keep the cache with row=-1 so a retry can find it
+    db.setSummaryCache(date, user, shiftKey, -1, totalUsed, remaining);
   }
 }
 

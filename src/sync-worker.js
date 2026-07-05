@@ -11,7 +11,7 @@ const db = require('./break-db');
 const CONFIG = require('./config');
 const { breakAppendRow, breakUpdateRange, updateRange, getOrCreateSheet, formatDate, getBreakSheetId, reapplyBreakNumberFormats } = require('./google');
 
-const SYNC_TIMEOUT = 90000; // 90s — OVH France has high latency to Google APIs
+const SYNC_TIMEOUT = 120000; // 120s — OVH France has high latency to Google APIs
 var processing = false;
 var SH = CONFIG.breakSheetId;
 

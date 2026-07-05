@@ -187,6 +187,15 @@ async function runArchive() {
     if (!ssId) throw new Error('breakSheetId not configured');
 
     const todayStr = getPHDateStr();
+    // Restore lastArchivedDate from SQLite (persists across PM2 restarts)
+    try {
+      var db = require('./break-db');
+      var storedDate = db.getSetting('lastArchivedDate');
+      if (storedDate && storedDate !== todayStr) {
+        console.log(ts + ' [ArchiveWorker] Restored lastArchivedDate from SQLite: ' + storedDate);
+        lastArchivedDate = storedDate;
+      }
+    } catch(e) {}
     console.log(ts + ' [ArchiveWorker] === ARCHIVE JOB START ===');
     console.log(ts + ' [ArchiveWorker] Timezone: Asia/Manila');
     console.log(ts + ' [ArchiveWorker] Today PH date: ' + todayStr);
@@ -207,6 +216,7 @@ async function runArchive() {
       console.log(ts + ' [ArchiveWorker] No data rows in CS BREAK (0 rows to archive)');
       // Mark as archived so we don't keep checking on every interval
       lastArchivedDate = todayStr;
+    try { require('./break-db').setSetting('lastArchivedDate', todayStr); } catch(e) {}
       console.log(ts + ' [ArchiveWorker] === ARCHIVE JOB COMPLETE (no data) ===');
       running = false;
       return;
@@ -240,6 +250,7 @@ async function runArchive() {
     if (rowsToMove.length === 0) {
       console.log(ts + ' [ArchiveWorker] No old data to archive (all rows are from today ' + todayStr + ')');
       lastArchivedDate = todayStr;
+    try { require('./break-db').setSetting('lastArchivedDate', todayStr); } catch(e) {}
       console.log(ts + ' [ArchiveWorker] === ARCHIVE JOB COMPLETE (no data to move) ===');
       running = false;
       return;
@@ -250,44 +261,36 @@ async function runArchive() {
     // Ensure Archives sheet exists
     await getOrCreateSheet(ssId, 'Archives');
 
-    // Get existing Archives data to know where to append
-    const existingArchive = await readRange(ssId, "'Archives'!A:O");
-    console.log(ts + ' [ArchiveWorker] Existing Archives rows: ' + (existingArchive ? existingArchive.length : 0));
-
-    // Normalize dates in both datasets before writing
+    // Normalize dates before writing
     normalizeDates(rowsToMove);
     normalizeDates(rowsToKeep);
 
-    // Determine append position in Archives
-    var archiveAppendRow = 1;
-    if (existingArchive && existingArchive.length > 0) {
-      archiveAppendRow = existingArchive.length + 1;
-    }
-
-    // Calculate final row position and expand grid if needed
-    var lastNeed = archiveAppendRow - 1 + rowsToMove.length;
-    if (!existingArchive || existingArchive.length === 0) {
-      lastNeed = 1 + rowsToMove.length;
-    }
-    await ensureArchiveGrid(ssId, lastNeed + 5);
-
     // ============================================================
-    //  WRITE TO ARCHIVES SHEET
+    //  WRITE TO ARCHIVES SHEET — use APPEND, no read needed
     // ============================================================
-    console.log(ts + ' [ArchiveWorker] Writing ' + rowsToMove.length + ' rows to Archives sheet...');
+    console.log(ts + ' [ArchiveWorker] Appending ' + rowsToMove.length + ' rows to Archives...');
 
-    if (!existingArchive || existingArchive.length === 0) {
-      // Archives is empty — write header + data rows
-      await updateRange(ssId, "'Archives'!A1", [data[0]]);
-      var endRow = 1 + rowsToMove.length;
-      await breakUpdateRange(ssId, "'Archives'!A2:O" + endRow, rowsToMove);
-      console.log(ts + ' [ArchiveWorker] ✓ Wrote header + ' + rowsToMove.length + ' data rows to Archives (A1:O' + endRow + ')');
-    } else {
-      // Archives has data — append after the last existing row
-      var startRow = archiveAppendRow;
-      var endRow2 = archiveAppendRow + rowsToMove.length - 1;
-      await breakUpdateRange(ssId, "'Archives'!A" + startRow + ":O" + endRow2, rowsToMove);
-      console.log(ts + ' [ArchiveWorker] ✓ Appended ' + rowsToMove.length + ' rows to Archives (A' + startRow + ':O' + endRow2 + ')');
+    // Ensure Archives sheet exists (uses getOrCreateSheet with error handling)
+    await getOrCreateSheet(ssId, 'Archives');
+
+    // Write header + all rows using breakAppendRow (auto-finds next empty row)
+    // First write header if Archives might be empty
+    try {
+      await breakAppendRow(ssId, "'Archives'!A:O", rowsToMove);
+      console.log(ts + ' [ArchiveWorker] ✓ Appended ' + rowsToMove.length + ' rows to Archives via append API');
+    } catch (appendErr) {
+      console.warn(ts + ' [ArchiveWorker] Append failed (' + appendErr.message + '), trying update with grid expansion...');
+      // Fallback: try to read just the first column to determine row count
+      var archCount = [];
+      try {
+        var archColA = await readRange(ssId, "'Archives'!A:A");
+        if (archColA) archCount = archColA;
+      } catch(e) {}
+      var startRow2 = (archCount && archCount.length > 0) ? archCount.length + 1 : 2;
+      var endRow3 = startRow2 + rowsToMove.length - 1;
+      await ensureArchiveGrid(ssId, endRow3 + 5);
+      await breakUpdateRange(ssId, "'Archives'!A" + startRow2 + ":O" + endRow3, rowsToMove);
+      console.log(ts + ' [ArchiveWorker] ✓ Appended ' + rowsToMove.length + ' rows to Archives via fallback (A' + startRow2 + ':O' + endRow3 + ')');
     }
 
     // ============================================================
@@ -301,36 +304,45 @@ async function runArchive() {
 
       // Delete rows beyond what we wrote (cleaner than writing empties)
       try {
-        var gsheets2 = google.sheets({
-          version: "v4",
-          auth: new google.auth.GoogleAuth({
-            credentials: key,
-            scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-          })
-        });
-        var ssInfo = await gsheets2.spreadsheets.get({ spreadsheetId: ssId });
-        var csSheet = ssInfo.data.sheets.find(function(s) { return s.properties.title === "CS BREAK"; });
-        if (csSheet) {
-          var totalRows = csSheet.properties.gridProperties.rowCount || 1000;
-          var rowsToDelete = totalRows - rowsToKeep.length;
-          if (rowsToDelete > 0 && rowsToDelete < totalRows) { // sanity check: don't delete all rows
-            await gsheets2.spreadsheets.batchUpdate({
-              spreadsheetId: ssId,
-              requestBody: {
-                requests: [{
-                  deleteDimension: {
-                    range: {
-                      sheetId: csSheet.properties.sheetId,
-                      dimension: "ROWS",
-                      startIndex: rowsToKeep.length,
-                      endIndex: totalRows
+        // Only attempt cleanup if there are data rows beyond the header
+        // Google Sheets does NOT allow deleting ALL non-frozen rows
+        if (rowsToKeep.length > 1) {
+          var gsheets2 = google.sheets({
+            version: "v4",
+            auth: new google.auth.GoogleAuth({
+              credentials: key,
+              scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+            })
+          });
+          var ssInfo = await gsheets2.spreadsheets.get({ spreadsheetId: ssId });
+          var csSheet = ssInfo.data.sheets.find(function(s) { return s.properties.title === "CS BREAK"; });
+          if (csSheet) {
+            var totalRows = csSheet.properties.gridProperties.rowCount || 1000;
+            var rowsToDelete = totalRows - rowsToKeep.length;
+            if (rowsToDelete > 0 && rowsToDelete < totalRows - 1) { // safety: leave at least 1 data row
+              await gsheets2.spreadsheets.batchUpdate({
+                spreadsheetId: ssId,
+                requestBody: {
+                  requests: [{
+                    deleteDimension: {
+                      range: {
+                        sheetId: csSheet.properties.sheetId,
+                        dimension: "ROWS",
+                        startIndex: rowsToKeep.length,
+                        endIndex: totalRows
+                      }
                     }
-                  }
-                }]
-              }
-            });
-            console.log(ts + ' [ArchiveWorker] ✓ Deleted ' + rowsToDelete + ' excess rows from CS BREAK (kept ' + rowsToKeep.length + ')');
+                  }]
+                }
+              });
+              console.log(ts + ' [ArchiveWorker] ✓ Deleted ' + rowsToDelete + ' excess rows from CS BREAK (kept ' + rowsToKeep.length + ')');
+            }
           }
+        } else {
+          console.log(ts + ' [ArchiveWorker] Skipped row cleanup — only header remains in CS BREAK');
+          // Clear residual data in row 2 so old July 5 rows don't show in the sheet UI
+          await breakUpdateRange(ssId, "'CS BREAK'!A2:O2", [[ '','','','','','','','','','','','','','','' ]]);
+          console.log(ts + ' [ArchiveWorker] ✓ Cleared residual data in row 2 (header-only sheet)');
         }
       } catch(e) {
         console.warn(ts + ' [ArchiveWorker] Row cleanup warning (non-fatal): ' + e.message);
@@ -341,6 +353,7 @@ async function runArchive() {
     //  ALL WRITES SUCCEEDED — NOW mark as archived for today
     // ============================================================
     lastArchivedDate = todayStr;
+    try { require('./break-db').setSetting('lastArchivedDate', todayStr); } catch(e) {}
     console.log(ts + ' [ArchiveWorker] ✅ MARKED: lastArchivedDate = ' + todayStr);
 
     // Re-apply professional formatting to all sheets
@@ -350,6 +363,22 @@ async function runArchive() {
     } catch (fmtErr) {
       console.warn(ts + ' [ArchiveWorker] Formatting error (non-fatal): ' + fmtErr.message);
     }
+
+    // Rebuild daily_summary_cache from fresh sheet data (rows shifted after archive)
+    try {
+      var db = require('./break-db');
+      var freshData = await readRange(ssId, 'DAILY SUMMARY!A:E');
+      if (freshData && freshData.length > 1) {
+        var imported = db.importSummaryCacheFromSheet(freshData);
+        console.log(ts + ' [ArchiveWorker] ✓ Rebuilt daily_summary_cache: ' + imported + ' entries');
+      } else {
+        db.clearSummaryCache();
+        console.log(ts + ' [ArchiveWorker] ✓ Cleared daily_summary_cache (no summary data)');
+      }
+    } catch (dsErr) {
+      console.warn(ts + ' [ArchiveWorker] Summary cache rebuild warning (non-fatal): ' + dsErr.message);
+    }
+
 
     console.log(ts + ' [ArchiveWorker] === ARCHIVE JOB COMPLETE ===');
     console.log(ts + ' [ArchiveWorker] ✅ Archived ' + rowsToMove.length + ' rows into Archives. CS BREAK now has ' + rowsToKeep.length + ' rows.');
@@ -510,6 +539,15 @@ async function hasOldDataToArchive() {
     if (!data || data.length < 2) return false;
 
     const todayStr = getPHDateStr();
+    // Restore lastArchivedDate from SQLite (persists across PM2 restarts)
+    try {
+      var db = require('./break-db');
+      var storedDate = db.getSetting('lastArchivedDate');
+      if (storedDate && storedDate !== todayStr) {
+        console.log(ts + ' [ArchiveWorker] Restored lastArchivedDate from SQLite: ' + storedDate);
+        lastArchivedDate = storedDate;
+      }
+    } catch(e) {}
     for (var i = 1; i < data.length; i++) {
       var row = data[i];
       if (!row || !row[0]) continue;
@@ -586,6 +624,19 @@ function startArchiveWorker(intervalMs) {
   intervalMs = intervalMs || 900000; // default: every 15 minutes
   const ts = _logTimestamp();
   console.log(ts + ' [ArchiveWorker] Started (interval: ' + (intervalMs / 1000) + 's)');
+
+  // Restore lastArchivedDate from SQLite so it survives PM2 restarts
+  // Must happen BEFORE scheduledCheck() to prevent redundant archive runs
+  try {
+    var db = require('./break-db');
+    if (typeof db.getSetting === 'function') {
+      var storedArchived = db.getSetting('lastArchivedDate');
+      if (storedArchived) {
+        lastArchivedDate = storedArchived;
+        console.log(ts + ' [ArchiveWorker] Restored lastArchivedDate from SQLite: ' + storedArchived);
+      }
+    }
+  } catch(e) {}
 
   // Run immediately on startup
   scheduledCheck().catch(function() {});

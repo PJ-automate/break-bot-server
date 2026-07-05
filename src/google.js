@@ -57,19 +57,45 @@ async function getSheetIdByName(spreadsheetId, sheetName) {
  */
 async function getOrCreateSheet(spreadsheetId, sheetName) {
   const sheets = getSheets();
-  const res = await sheets.spreadsheets.get({ spreadsheetId });
+  var res;
+  try {
+    res = await Promise.race([
+      sheets.spreadsheets.get({ spreadsheetId }),
+      timeoutPromise(60000)
+    ]);
+  } catch (timeoutErr) {
+    // On timeout from OVH France, assume sheet exists and use cached ID if known
+    console.warn('[Google] getOrCreateSheet timeout for ' + sheetName + ' - assuming exists');
+    return { sheetId: null, created: false, timeout: true };
+  }
   let sheet = res.data.sheets.find(s => s.properties.title === sheetName);
 
   if (sheet) {
     return { sheetId: sheet.properties.sheetId, created: false };
   }
 
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests: [{ addSheet: { properties: { title: sheetName } } }]
+  // Sheet not found — try to create it
+  try {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{ addSheet: { properties: { title: sheetName } } }]
+      }
+    });
+  } catch (err) {
+    // If it already exists (race condition or stale metadata), just re-fetch
+    if (err.message && err.message.indexOf('already exists') >= 0) {
+      console.log('[Google] Sheet "' + sheetName + '" already exists (race), re-fetching...');
+      try {
+        var res3 = await sheets.spreadsheets.get({ spreadsheetId });
+        sheet = res3.data.sheets.find(s => s.properties.title === sheetName);
+        return { sheetId: sheet ? sheet.properties.sheetId : null, created: false };
+      } catch (e) {
+        return { sheetId: null, created: false };
+      }
     }
-  });
+    throw err;
+  }
 
   const res2 = await sheets.spreadsheets.get({ spreadsheetId });
   sheet = res2.data.sheets.find(s => s.properties.title === sheetName);
@@ -108,7 +134,7 @@ function releaseReadSlot(spreadsheetId) {
   }
 }
 
-const GOOGLE_API_TIMEOUT = 40000; // 40s — OVH France has high latency to Google APIs
+const GOOGLE_API_TIMEOUT = 90000; // 90s — OVH France has very high latency to Google APIs
 
 function timeoutPromise(ms) {
   return new Promise(function(_, reject) {
@@ -208,6 +234,8 @@ async function appendRow(spreadsheetId, range, values) {
 
 async function breakAppendRow(spreadsheetId, range, values) {
   const sheets = getSheets();
+  // Support both single-row (1D array) and multi-row (2D array) appends
+  var requestValues = Array.isArray(values) && Array.isArray(values[0]) ? values : [values];
   var maxRetries = 5;
   for (var attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -215,7 +243,7 @@ async function breakAppendRow(spreadsheetId, range, values) {
         spreadsheetId, range,
         valueInputOption: 'RAW',
         insertDataOption: 'INSERT_ROWS',
-        requestBody: { values: [values] }
+        requestBody: { values: requestValues }
       });
       return res.data;
     } catch (err) {

@@ -47,7 +47,32 @@ function initDB() {
     )
   `);
 
-  // Sync queue — pending Google Sheet operations
+  // Daily summary cache — tracks which rows exist in DAILY SUMMARY sheet
+  // Eliminates the need to read the full sheet to find matching rows,
+  // which was causing 40s timeouts from OVH France to Google APIs.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS daily_summary_cache (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      business_date TEXT NOT NULL,
+      user_name TEXT NOT NULL,
+      shift_key TEXT NOT NULL,
+      sheet_row INTEGER NOT NULL DEFAULT 0,
+      total_used TEXT DEFAULT '',
+      remaining TEXT DEFAULT '',
+      updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+      UNIQUE(business_date, user_name, shift_key)
+    )
+  `);
+  // Settings table for persistent key-value storage across restarts
+  // Used to persist lastArchivedDate, lastChecked times, etc.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+    )
+  `);
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS sync_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,6 +201,18 @@ function endBreak(userId, endTimeStr) {
     bd: active.business_date, userName: active.user_name,
     shiftType: active.shift_type, shiftPeriod: active.shift_period
   });
+
+  // Immediately update daily_summary_cache so DAILY SUMMARY data is never lost
+  // even if the background sheet write times out
+  var shiftKey = active.shift_type + ' (' + active.shift_period + ')';
+  d.prepare(`
+    INSERT INTO daily_summary_cache (business_date, user_name, shift_key, sheet_row, total_used, remaining)
+    VALUES (?, ?, ?, -1, ?, ?)
+    ON CONFLICT(business_date, user_name, shift_key) DO UPDATE SET
+      total_used = excluded.total_used,
+      remaining = excluded.remaining,
+      updated_at = datetime('now', 'localtime')
+  `).run(active.business_date, active.user_name, shiftKey, totalHMS, remHMS);
 
   return {
     row: active,
@@ -334,15 +371,127 @@ function importFromSheetData(sheetData) {
 }
 
 /**
- * Close the database.
+ * Get cached sheet row for a daily summary entry.
+ * Returns { sheet_row, total_used, remaining } or null.
  */
+function getSummaryCache(businessDate, userName, shiftKey) {
+  const d = getDB();
+  return d.prepare(`
+    SELECT sheet_row, total_used, remaining FROM daily_summary_cache
+    WHERE business_date = ? AND user_name = ? AND shift_key = ?
+  `).get(businessDate, userName, shiftKey);
+}
+
+/**
+ * Set/update cached sheet row for a daily summary entry.
+ */
+function setSummaryCache(businessDate, userName, shiftKey, sheetRow, totalUsed, remaining) {
+  const d = getDB();
+  d.prepare(`
+    INSERT INTO daily_summary_cache (business_date, user_name, shift_key, sheet_row, total_used, remaining)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(business_date, user_name, shift_key) DO UPDATE SET
+      sheet_row = excluded.sheet_row,
+      total_used = excluded.total_used,
+      remaining = excluded.remaining,
+      updated_at = datetime('now', 'localtime')
+  `).run(businessDate, userName, shiftKey, sheetRow, totalUsed, remaining);
+}
+
+/**
+ * Get all summary cache entries for a given date.
+ * Used after archive to rebuild cache from sheet data.
+ */
+function getSummaryCacheByDate(businessDate) {
+  const d = getDB();
+  return d.prepare(`
+    SELECT * FROM daily_summary_cache WHERE business_date = ?
+  `).all(businessDate);
+}
+
+/**
+ * Clear all summary cache entries (after archive, when rows shift).
+ */
+function clearSummaryCache() {
+  const d = getDB();
+  d.prepare(`DELETE FROM daily_summary_cache`).run();
+}
+
+/**
+ * Convert a cell value to a YYYY-MM-DD date string for caching.
+ * Handles serial numbers (46204), Date objects, and strings.
+ */
+function _cellToDateStr(value) {
+  if (!value) return '';
+  // Already a YYYY-MM-DD string
+  var str = String(value);
+  var m = str.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (m) return m[1];
+  // Google Sheets serial number
+  var num = Number(value);
+  if (!isNaN(num) && num > 40000 && num < 60000) {
+    var d = new Date((num - 25569) * 86400000);
+    return d.toISOString().substring(0, 10);
+  }
+  return str.substring(0, 10);
+}
+
+/**
+ * Bulk insert summary cache entries from sheet data.
+ * Used after archive to rebuild cache from fresh sheet read.
+ */
+function importSummaryCacheFromSheet(sheetData) {
+  const d = getDB();
+  if (!sheetData || sheetData.length < 2) return 0;
+  var count = 0;
+  // Clear existing cache first
+  d.prepare(`DELETE FROM daily_summary_cache`).run();
+  var insert = d.prepare(`
+    INSERT OR IGNORE INTO daily_summary_cache (business_date, user_name, shift_key, sheet_row, total_used, remaining)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  for (let i = 1; i < sheetData.length; i++) {
+    var r = sheetData[i];
+    if (!r || !r[0] || !r[1]) continue;
+    var dateStr = _cellToDateStr(r[0]);
+    if (!dateStr) continue;
+    var shiftKey = String(r[2] || '');
+    if (!shiftKey) continue;
+    insert.run(dateStr, r[1], shiftKey, i + 1, String(r[3] || ''), String(r[4] || ''));
+    count++;
+  }
+  return count;
+}
 function closeDB() {
   if (db) { db.close(); db = null; }
+}
+
+/**
+ * Get a persistent setting value.
+ */
+function getSetting(key) {
+  const d = getDB();
+  var row = d.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  return row ? row.value : null;
+}
+
+/**
+ * Set a persistent setting value.
+ */
+function setSetting(key, value) {
+  const d = getDB();
+  d.prepare(`
+    INSERT INTO settings (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now', 'localtime')
+  `).run(key, value);
 }
 
 module.exports = {
   initDB, getDB, closeDB,
   startBreak, endBreak, getActiveBreak, getTodayHistory,
   getPendingSyncs, markSyncDone, markSyncFailed, queueSync,
-  getAllActiveBreaks, importFromSheetData
+  getAllActiveBreaks, importFromSheetData,
+  getSummaryCache, setSummaryCache, getSummaryCacheByDate,
+  clearSummaryCache, importSummaryCacheFromSheet,
+  getSetting, setSetting
 };

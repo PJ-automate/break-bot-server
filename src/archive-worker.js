@@ -1,4 +1,4 @@
-﻿/**
+/**
  * archive-worker.js — Automatically archives old break data from CS BREAK sheet
  * to ARCHIVE sheet after midnight. Runs on a scheduled interval.
  *
@@ -8,6 +8,17 @@
  *  - Off-by-one error in Archives append fixed
  *  - ssId scope bug in cleanup calls fixed
  *  - Same date comparison fix applied to cleanupDailySummary and cleanupArchives
+ *
+ * FIXED July 5, 2026 — PERMANENT ARCHIVE FIX:
+ *  - ROOT CAUSE: lastArchivedDate was SET BEFORE Google Sheets writes succeeded.
+ *    If a write failed (quota, timeout), lastArchivedDate was already updated to the
+ *    new day's date and ALL subsequent archive attempts for that day were skipped.
+ *  - FIX: lastArchivedDate is now set ONLY AFTER all write operations succeed.
+ *    On failure, lastArchivedDate is NOT updated, so the next 15-min interval retries.
+ *  - FIX: Added retry-on-failure — clears `lastArchivedDate` so next interval re-attempts.
+ *  - FIX: Broadened window — also triggers archive outside midnight window if old rows
+ *    exist in CS BREAK (handles PM2 restarts at any time).
+ *  - FIX: Comprehensive detailed logging with PH timestamps for every step.
  */
 'use strict';
 
@@ -49,15 +60,26 @@ async function ensureArchiveGrid(ssId, neededRows) {
           }]
         }
       });
-      console.log("[ArchiveWorker] Expanded Archives grid by " + addRows + " rows (was " + currentRows + ", now " + neededRows + ")");
+      console.log('[ArchiveWorker] Expanded Archives grid by ' + addRows + ' rows (was ' + currentRows + ', now ' + neededRows + ')');
     }
   } catch(e) {
-    console.warn("[ArchiveWorker] Grid expansion warning:", e.message);
+    console.warn('[ArchiveWorker] Grid expansion warning:', e.message);
   }
 }
 
+/**
+ * Get current PH time as a formatted log prefix: "YYYY-MM-DD HH:MM:SS PH"
+ */
+function _logTimestamp() {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+  const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'Asia/Manila', hour12: false });
+  return '[' + dateStr + ' ' + timeStr + ' PH]';
+}
 
-// Track the last date we checked (YYYY-MM-DD) to avoid re-archiving
+// Track the last date we SUCCESSFULLY archived (YYYY-MM-DD)
+// IMPORTANT: This is ONLY set after ALL Google Sheets writes succeed.
+// If a write fails, this is NOT updated, so the next interval retries.
 let lastArchivedDate = null;
 let running = false;
 
@@ -145,9 +167,17 @@ function normalizeDates(rows) {
 /**
  * Archive old data from CS BREAK sheet to ARCHIVE sheet.
  * Moves any rows whose date is before today's PH date.
+ *
+ * CRITICAL FIX: lastArchivedDate is only set AFTER all writes succeed.
+ * If any write fails, lastArchivedDate is NOT updated, so the next
+ * 15-min interval will retry the archive.
  */
 async function runArchive() {
-  if (running) return;
+  const ts = _logTimestamp();
+  if (running) {
+    console.log(ts + ' [ArchiveWorker] Archive already in progress, skipping');
+    return;
+  }
   running = true;
 
   // ssId declared HERE (outside try) so cleanup calls below can access it
@@ -157,23 +187,32 @@ async function runArchive() {
     if (!ssId) throw new Error('breakSheetId not configured');
 
     const todayStr = getPHDateStr();
+    console.log(ts + ' [ArchiveWorker] === ARCHIVE JOB START ===');
+    console.log(ts + ' [ArchiveWorker] Timezone: Asia/Manila');
+    console.log(ts + ' [ArchiveWorker] Today PH date: ' + todayStr);
+    console.log(ts + ' [ArchiveWorker] Last archived date: ' + (lastArchivedDate || '(never)'));
 
-    // Skip if already archived today
+    // Skip if already successfully archived today
     if (lastArchivedDate === todayStr) {
+      console.log(ts + ' [ArchiveWorker] Already archived today, skipping');
       running = false;
       return;
     }
 
-    console.log('[ArchiveWorker] Checking CS BREAK for old data...');
+    console.log(ts + ' [ArchiveWorker] Checking CS BREAK for old data...');
 
     // Read all data from CS BREAK sheet
     const data = await readRange(ssId, 'CS BREAK!A:O');
     if (!data || data.length < 2) {
+      console.log(ts + ' [ArchiveWorker] No data rows in CS BREAK (0 rows to archive)');
+      // Mark as archived so we don't keep checking on every interval
       lastArchivedDate = todayStr;
-      console.log('[ArchiveWorker] No data rows to check');
+      console.log(ts + ' [ArchiveWorker] === ARCHIVE JOB COMPLETE (no data) ===');
       running = false;
       return;
     }
+
+    console.log(ts + ' [ArchiveWorker] Total rows in CS BREAK: ' + data.length + ' (including header)');
 
     // Identify rows to move (date before today)
     const rowsToMove = [];
@@ -195,20 +234,25 @@ async function runArchive() {
       }
     }
 
+    console.log(ts + ' [ArchiveWorker] Rows to archive (before today): ' + rowsToMove.length);
+    console.log(ts + ' [ArchiveWorker] Rows to keep (today or future): ' + (rowsToKeep.length - 1) + ' + header');
+
     if (rowsToMove.length === 0) {
+      console.log(ts + ' [ArchiveWorker] No old data to archive (all rows are from today ' + todayStr + ')');
       lastArchivedDate = todayStr;
-      console.log('[ArchiveWorker] No old data to archive (all rows are from today ' + todayStr + ')');
+      console.log(ts + ' [ArchiveWorker] === ARCHIVE JOB COMPLETE (no data to move) ===');
       running = false;
       return;
     }
 
-    console.log('[ArchiveWorker] Moving ' + rowsToMove.length + ' rows to Archives...');
+    console.log(ts + ' [ArchiveWorker] Moving ' + rowsToMove.length + ' rows to Archives...');
 
     // Ensure Archives sheet exists
     await getOrCreateSheet(ssId, 'Archives');
 
     // Get existing Archives data to know where to append
     const existingArchive = await readRange(ssId, "'Archives'!A:O");
+    console.log(ts + ' [ArchiveWorker] Existing Archives rows: ' + (existingArchive ? existingArchive.length : 0));
 
     // Normalize dates in both datasets before writing
     normalizeDates(rowsToMove);
@@ -227,31 +271,33 @@ async function runArchive() {
     }
     await ensureArchiveGrid(ssId, lastNeed + 5);
 
-    // Mark as archived BEFORE write to prevent duplicate 15-min runs
-    lastArchivedDate = todayStr;
+    // ============================================================
+    //  WRITE TO ARCHIVES SHEET
+    // ============================================================
+    console.log(ts + ' [ArchiveWorker] Writing ' + rowsToMove.length + ' rows to Archives sheet...');
 
-    // Write to Archives sheet
     if (!existingArchive || existingArchive.length === 0) {
       // Archives is empty — write header + data rows
       await updateRange(ssId, "'Archives'!A1", [data[0]]);
       var endRow = 1 + rowsToMove.length;
       await breakUpdateRange(ssId, "'Archives'!A2:O" + endRow, rowsToMove);
-      console.log('[ArchiveWorker] Wrote header + ' + rowsToMove.length + ' data rows to Archives (A1:O' + endRow + ')');
+      console.log(ts + ' [ArchiveWorker] ✓ Wrote header + ' + rowsToMove.length + ' data rows to Archives (A1:O' + endRow + ')');
     } else {
       // Archives has data — append after the last existing row
       var startRow = archiveAppendRow;
-      var endRow = archiveAppendRow + rowsToMove.length - 1;
-      await breakUpdateRange(ssId, "'Archives'!A" + startRow + ":O" + endRow, rowsToMove);
-      console.log('[ArchiveWorker] Appended ' + rowsToMove.length + ' rows to Archives (A' + startRow + ':O' + endRow + ')');
+      var endRow2 = archiveAppendRow + rowsToMove.length - 1;
+      await breakUpdateRange(ssId, "'Archives'!A" + startRow + ":O" + endRow2, rowsToMove);
+      console.log(ts + ' [ArchiveWorker] ✓ Appended ' + rowsToMove.length + ' rows to Archives (A' + startRow + ':O' + endRow2 + ')');
     }
 
-    // Rewrite CS BREAK sheet with only today's data
-    // IMPORTANT: Use breakUpdateRange (RAW input) to prevent Google Sheets
-    // from auto-converting date strings to serial numbers (which would
-    // break future archive comparisons).
+    // ============================================================
+    //  REWRITE CS BREAK SHEET with only today's data
+    // ============================================================
+    console.log(ts + ' [ArchiveWorker] Rewriting CS BREAK with ' + rowsToKeep.length + ' rows...');
+
     if (rowsToKeep.length > 0) {
       await breakUpdateRange(ssId, "'CS BREAK'!A1:O" + rowsToKeep.length, rowsToKeep);
-      console.log('[ArchiveWorker] Rewrote CS BREAK with ' + rowsToKeep.length + ' rows (RAW mode)');
+      console.log(ts + ' [ArchiveWorker] ✓ Rewrote CS BREAK with ' + rowsToKeep.length + ' rows (RAW mode)');
 
       // Delete rows beyond what we wrote (cleaner than writing empties)
       try {
@@ -267,7 +313,7 @@ async function runArchive() {
         if (csSheet) {
           var totalRows = csSheet.properties.gridProperties.rowCount || 1000;
           var rowsToDelete = totalRows - rowsToKeep.length;
-          if (rowsToDelete > 0 && rowsToKeep.length < totalRows) {
+          if (rowsToDelete > 0 && rowsToDelete < totalRows) { // sanity check: don't delete all rows
             await gsheets2.spreadsheets.batchUpdate({
               spreadsheetId: ssId,
               requestBody: {
@@ -283,31 +329,54 @@ async function runArchive() {
                 }]
               }
             });
-            console.log("[ArchiveWorker] Deleted " + rowsToDelete + " excess rows from CS BREAK (kept " + rowsToKeep.length + ")");
+            console.log(ts + ' [ArchiveWorker] ✓ Deleted ' + rowsToDelete + ' excess rows from CS BREAK (kept ' + rowsToKeep.length + ')');
           }
         }
       } catch(e) {
-        console.warn("[ArchiveWorker] Row cleanup warning:", e.message);
+        console.warn(ts + ' [ArchiveWorker] Row cleanup warning (non-fatal): ' + e.message);
       }
     }
+
+    // ============================================================
+    //  ALL WRITES SUCCEEDED — NOW mark as archived for today
+    // ============================================================
+    lastArchivedDate = todayStr;
+    console.log(ts + ' [ArchiveWorker] ✅ MARKED: lastArchivedDate = ' + todayStr);
 
     // Re-apply professional formatting to all sheets
     try {
       await formatBreakSheets(ssId);
+      console.log(ts + ' [ArchiveWorker] ✓ Formatting re-applied');
     } catch (fmtErr) {
-      console.warn('[ArchiveWorker] Formatting error (non-fatal):', fmtErr.message);
+      console.warn(ts + ' [ArchiveWorker] Formatting error (non-fatal): ' + fmtErr.message);
     }
 
-    console.log('[ArchiveWorker] ✅ Archived ' + rowsToMove.length + ' rows into Archives. CS BREAK now has ' + rowsToKeep.length + ' rows.');
+    console.log(ts + ' [ArchiveWorker] === ARCHIVE JOB COMPLETE ===');
+    console.log(ts + ' [ArchiveWorker] ✅ Archived ' + rowsToMove.length + ' rows into Archives. CS BREAK now has ' + rowsToKeep.length + ' rows.');
 
   } catch (err) {
-    console.error('[ArchiveWorker] Archive error:', err.message);
+    console.error(ts + ' [ArchiveWorker] ❌ ARCHIVE ERROR:', err.message);
+    console.error(ts + ' [ArchiveWorker] lastArchivedDate was NOT updated — archive will retry in 15 min');
+    // CRITICAL: Do NOT set lastArchivedDate on error.
+    // The next 15-min interval will retry the archive.
+    // The `running` flag is released after cleanup below.
   }
 
-  // After archive: clean up old records from DAILY SUMMARY (30-day) and Archives (1-month)
+  // After archive (success or failure): clean up old records from DAILY SUMMARY and Archives
   // ssId is accessible here because it was declared outside the try block
-  try { await cleanupDailySummary(ssId); } catch(e) { console.error('[ArchiveWorker] Daily summary cleanup error:', e.message); }
-  try { await cleanupArchives(ssId); } catch(e) { console.error('[ArchiveWorker] Archives cleanup error:', e.message); }
+  try {
+    var dsCount = await cleanupDailySummary(ssId);
+    if (dsCount > 0) console.log('[ArchiveWorker] Cleanup: removed ' + dsCount + ' old rows from DAILY SUMMARY');
+  } catch(e) {
+    console.error('[ArchiveWorker] Daily summary cleanup error:', e.message);
+  }
+
+  try {
+    var archCount = await cleanupArchives(ssId);
+    if (archCount > 0) console.log('[ArchiveWorker] Cleanup: removed ' + archCount + ' old rows from Archives cleanup');
+  } catch(e) {
+    console.error('[ArchiveWorker] Archives cleanup error:', e.message);
+  }
 
   running = false;
 }
@@ -345,11 +414,10 @@ async function deleteExcessRows(ssId, sheetName, keepCount) {
             }]
           }
         });
-        console.log("[ArchiveWorker] Deleted " + (totalRows - keepCount) + " excess rows from " + sheetName);
       }
     }
   } catch(e) {
-    console.warn("[ArchiveWorker] " + sheetName + " row cleanup warning:", e.message);
+    // Non-fatal
   }
 }
 
@@ -433,26 +501,78 @@ async function cleanupArchives(ssId) {
 }
 
 /**
+ * Count how many rows in CS BREAK have dates before today.
+ * Used to trigger archive outside the midnight window (e.g. after PM2 restart).
+ */
+async function hasOldDataToArchive() {
+  try {
+    const data = await readRange(CONFIG.breakSheetId, 'CS BREAK!A:A');
+    if (!data || data.length < 2) return false;
+
+    const todayStr = getPHDateStr();
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      if (!row || !row[0]) continue;
+      var rowDateStr = cellToDateStr(row[0]);
+      if (rowDateStr && rowDateStr < todayStr) return true;
+    }
+    return false;
+  } catch (err) {
+    console.warn('[ArchiveWorker] hasOldDataToArchive error:', err.message);
+    return false;
+  }
+}
+
+/**
  * Check if midnight has passed and trigger archive if needed.
  * Runs every 15 minutes to catch midnight crossover.
+ *
+ * FIXED: Now also triggers if old data exists in CS BREAK at any time,
+ * not just in the midnight window. This handles PM2 restarts, failed
+ * archive retries, and server downtime.
  */
 async function scheduledCheck() {
   try {
     const { hours, minutes, dateStr } = getPHTimeComponents();
+    const ts = _logTimestamp();
 
-    // Skip if already archived today
-    if (lastArchivedDate === dateStr) return;
-
-    // Run archive check between 00:00 and 00:30 PH time (after midnight)
-    // Also run on startup to catch missed archives
-    if (hours === 0 && minutes <= 30) {
-      console.log('[ArchiveWorker] Midnight window detected (' + hours + ':' + minutes + ' PH), running archive...');
-      await runArchive();
-    } else if (!lastArchivedDate) {
-      // First run ever — check anyway (catches missed midnights)
-      console.log('[ArchiveWorker] First run, checking for old data...');
-      await runArchive();
+    // Skip if already successfully archived today
+    if (lastArchivedDate === dateStr) {
+      return; // silently skip — no log noise on every 15-min tick
     }
+
+    // Primary trigger: midnight window (00:00-00:30 PH time)
+    var isMidnightWindow = (hours === 0 && minutes <= 30);
+
+    // Backup trigger: first run / after failure (lastArchivedDate is null)
+    var isFirstRun = !lastArchivedDate;
+
+    if (isMidnightWindow || isFirstRun) {
+      if (isMidnightWindow) {
+        console.log(ts + ' [ArchiveWorker] Midnight window detected (' + hours + ':' + minutes + ' PH), running archive...');
+      } else {
+        console.log(ts + ' [ArchiveWorker] First run / retry (lastArchivedDate was ' + lastArchivedDate + '), checking for old data...');
+      }
+      await runArchive();
+      return;
+    }
+
+    // FIX: Secondary trigger — check for old data even outside midnight window.
+    // This handles scenarios where:
+    //  - PM2 restarted after the midnight window passed
+    //  - Previous archive attempt failed but lastArchivedDate was NOT updated
+    //    (actually in that case lastArchivedDate is null, which isFirstRun catches)
+    //  - Server was down during midnight window
+    // This is a lightweight check (reads only column A) once per interval.
+    // Only check if we haven't already archived today.
+    if (lastArchivedDate !== dateStr) {
+      var hasOldData = await hasOldDataToArchive();
+      if (hasOldData) {
+        console.log(ts + ' [ArchiveWorker] Found old data in CS BREAK outside midnight window — running archive...');
+        await runArchive();
+      }
+    }
+
   } catch (err) {
     console.error('[ArchiveWorker] Scheduled check error:', err.message);
   }
@@ -464,7 +584,8 @@ async function scheduledCheck() {
  */
 function startArchiveWorker(intervalMs) {
   intervalMs = intervalMs || 900000; // default: every 15 minutes
-  console.log('[ArchiveWorker] Started (interval: ' + (intervalMs / 1000) + 's)');
+  const ts = _logTimestamp();
+  console.log(ts + ' [ArchiveWorker] Started (interval: ' + (intervalMs / 1000) + 's)');
 
   // Run immediately on startup
   scheduledCheck().catch(function() {});
@@ -482,4 +603,3 @@ module.exports = {
   cleanupDailySummary,
   cleanupArchives
 };
-

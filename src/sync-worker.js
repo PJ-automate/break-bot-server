@@ -1,4 +1,4 @@
-﻿/**
+/**
  * sync-worker.js — Background Google Sheet sync for Break Tracker.
  * Reads pending syncs from SQLite and pushes to Google Sheets.
  * Runs in background — never blocks user commands.
@@ -328,4 +328,3 @@ module.exports = {
   processSyncQueue,
   startSyncWorker
 };
-

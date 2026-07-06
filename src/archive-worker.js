@@ -23,7 +23,7 @@
 'use strict';
 
 const CONFIG = require('./config');
-const { readRange, getOrCreateSheet, updateRange, breakUpdateRange, breakBatchUpdate, formatBreakSheets } = require('./google');
+const { readRange, getOrCreateSheet, updateRange, breakAppendRow, breakUpdateRange, breakBatchUpdate, formatBreakSheets } = require('./google');
 const { google } = require("googleapis");
 const key = require(CONFIG.breakServiceAccountPath);
 
@@ -43,7 +43,7 @@ async function ensureArchiveGrid(ssId, neededRows) {
   try {
     const sheets = await _getGridSheets();
     const ss = await sheets.spreadsheets.get({ spreadsheetId: ssId });
-    const archSheet = ss.data.sheets.find(function(s) { return s.properties.title === "Archives"; });
+    const archSheet = ss.data.sheets.find(function(s) { return s.properties.title.toUpperCase() === "ARCHIVES"; });
     if (!archSheet) return;
     const currentRows = archSheet.properties.gridProperties.rowCount || 0;
     if (neededRows > currentRows) {
@@ -259,7 +259,7 @@ async function runArchive() {
     console.log(ts + ' [ArchiveWorker] Moving ' + rowsToMove.length + ' rows to Archives...');
 
     // Ensure Archives sheet exists
-    await getOrCreateSheet(ssId, 'Archives');
+    await getOrCreateSheet(ssId, "ARCHIVES");
 
     // Normalize dates before writing
     normalizeDates(rowsToMove);
@@ -271,7 +271,7 @@ async function runArchive() {
     console.log(ts + ' [ArchiveWorker] Appending ' + rowsToMove.length + ' rows to Archives...');
 
     // Ensure Archives sheet exists (uses getOrCreateSheet with error handling)
-    await getOrCreateSheet(ssId, 'Archives');
+    await getOrCreateSheet(ssId, "ARCHIVES");
 
     // Write header + all rows using breakAppendRow (auto-finds next empty row)
     // First write header if Archives might be empty
@@ -520,7 +520,7 @@ async function cleanupArchives(ssId) {
     normalizeDates(rowsToKeep);
     await ensureArchiveGrid(ssId, rowsToKeep.length + 5);
     await updateRange(ssId, "'Archives'!A1:O" + rowsToKeep.length, rowsToKeep);
-    await deleteExcessRows(ssId, 'Archives', rowsToKeep.length);
+    await deleteExcessRows(ssId, 'ARCHIVES', rowsToKeep.length);
     console.log('[ArchiveWorker] ✅ Archives cleanup: removed ' + deletedCount + ' rows older than ' + cutoffDate);
     return deletedCount;
   } catch (err) {

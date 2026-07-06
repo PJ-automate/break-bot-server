@@ -360,7 +360,7 @@ async function formatBreakSheets(spreadsheetId) {
 
     if (name === 'CS BREAK') {
       await formatCSBreakSheet(ss, spreadsheetId, sheetId);
-    } else if (name === 'Archives') {
+    } else if (name.toUpperCase() === 'ARCHIVES') {
       await formatArchivesSheet(ss, spreadsheetId, sheetId);
     } else if (name === 'DAILY SUMMARY') {
       await formatDailySummarySheet(ss, spreadsheetId, sheetId);

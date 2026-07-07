@@ -439,14 +439,19 @@ function recalcDailySummary() {
     summaryData.push([today, u.userName, u.shift + ' (' + u.period + ')', usedStr, remStr]);
   }
 
-  summarySheet.clear();
-  for (var r = 0; r < summaryData.length; r++) {
-    summarySheet.appendRow(summaryData[r]);
+  summarySheet.clear({ contentsOnly: true });
+  if (summaryData.length > 1) {
+    // Batch write all summary data at once (FAST)
+    summarySheet.getRange(1, 1, summaryData.length, 5).setValues(summaryData);
   }
 
   // Step 3: Update each row's Total (L) and Remaining (I) in CS BREAK for today
+  // PERFORMANCE FIX: Use batch setValues instead of individual setValue calls
   var breakSheet = getBreakSheet();
   var runningTotals = {};
+  var totalBatch = []; // 2D array for column L (Total)
+  var remBatch = [];   // 2D array for column I (Remaining)
+  var todayCount = 0;
 
   for (var ii = 1; ii < data.length; ii++) {
     var uid = data[ii][10] ? data[ii][10].toString() : '';
@@ -455,25 +460,36 @@ function recalcDailySummary() {
     var bt = data[ii][4] ? data[ii][4].toString() : '';
     var rd = data[ii][0];
 
-    if (!uid || !rd || sh === 'RESET' || bt === 'SHIFT_SET') continue;
-    var bd2 = getBusinessDate(new Date(rd), per); // ✅ Fixed: uses TZ_PH internally
-    if (bd2 !== today) continue;
+    if (!uid || !rd || sh === 'RESET' || bt === 'SHIFT_SET') {
+      totalBatch.push(['']);
+      remBatch.push(['']);
+      continue;
+    }
+    var bd2 = getBusinessDate(new Date(rd), per);
+    if (bd2 !== today) {
+      totalBatch.push(['']);
+      remBatch.push(['']);
+      continue;
+    }
 
     var kk = uid + '_' + sh + '_' + per;
     var allowance2 = (sh === '12h') ? 7200 : 5400;
 
-    // Accumulate running total up to this row
     if (!runningTotals[kk]) runningTotals[kk] = 0;
     var rowDur = data[ii][7];
     runningTotals[kk] += parseHMS(rowDur);
 
     var totalHere = runningTotals[kk];
     var remHere = allowance2 - totalHere;
-    var remStrHere = remHere >= 0 ? '✅ ' + formatSecsToHMS(remHere) : '⚠️ Over: -' + formatSecsToHMS(Math.abs(remHere));
-    var totalStrHere = formatSecsToHMS(totalHere);
+    totalBatch.push([formatSecsToHMS(totalHere)]);
+    remBatch.push([remHere >= 0 ? '✅ ' + formatSecsToHMS(remHere) : '⚠️ Over: -' + formatSecsToHMS(Math.abs(remHere))]);
+    todayCount++;
+  }
 
-    breakSheet.getRange(ii + 1, 12).setValue(totalStrHere);
-    breakSheet.getRange(ii + 1, 9).setValue(remStrHere);
+  // Batch write all totals at once (FAST — replaces individual setValue calls)
+  if (totalBatch.length > 0) {
+    breakSheet.getRange(2, 12, totalBatch.length, 1).setValues(totalBatch); // Column L
+    breakSheet.getRange(2, 9, remBatch.length, 1).setValues(remBatch);     // Column I
   }
 
   return true;

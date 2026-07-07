@@ -927,7 +927,7 @@ async function updateDailySummary(date, user, shift, period, totalUsed, remainin
   if (cached && cached.sheet_row > 0) {
     try {
       await withTimeout(breakUpdateRange(SH, 'DAILY SUMMARY!C' + cached.sheet_row + ':E' + cached.sheet_row, [[
-        shiftKey, timeToSerial(totalUsed), remaining
+        shiftKey, totalUsed, remaining
       ]]), 60000, 'breakUpdateRange DS');
       db.setSummaryCache(date, user, shiftKey, cached.sheet_row, totalUsed, remaining);
       console.log('[DS] Updated existing row ' + cached.sheet_row + ' for ' + user);
@@ -943,7 +943,7 @@ async function updateDailySummary(date, user, shift, period, totalUsed, remainin
   // If a duplicate is created (rare race condition), it will be merged on next archive.
   try {
     var appendResult = await withTimeout(breakAppendRow(SH, 'DAILY SUMMARY!A:E', [
-      dateToSerial(date), user, shiftKey, timeToSerial(totalUsed), remaining
+      date, user, shiftKey, totalUsed, remaining
     ]), 120000, 'breakAppendRow DS');
     if (appendResult && appendResult.updates && appendResult.updates.updatedRange) {
       var match = appendResult.updates.updatedRange.match(/A(\d+):/);

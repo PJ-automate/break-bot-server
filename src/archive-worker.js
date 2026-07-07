@@ -504,7 +504,7 @@ async function cleanupDailySummary(ssId) {
     if (deletedCount === 0) return 0;
 
     normalizeDates(rowsToKeep);
-    await updateRange(ssId, "'DAILY SUMMARY'!A1:E" + rowsToKeep.length, rowsToKeep);
+    await breakUpdateRange(ssId, "'DAILY SUMMARY'!A1:E" + rowsToKeep.length, rowsToKeep);
     await deleteExcessRows(ssId, 'DAILY SUMMARY', rowsToKeep.length);
     console.log('[ArchiveWorker] ✅ DAILY SUMMARY cleanup: removed ' + deletedCount + ' rows older than ' + cutoffDate);
     return deletedCount;
@@ -544,7 +544,7 @@ async function cleanupArchives(ssId) {
 
     normalizeDates(rowsToKeep);
     await ensureArchiveGrid(ssId, rowsToKeep.length + 5);
-    await updateRange(ssId, "'Archives'!A1:O" + rowsToKeep.length, rowsToKeep);
+    await breakUpdateRange(ssId, "'Archives'!A1:O" + rowsToKeep.length, rowsToKeep);
     await deleteExcessRows(ssId, 'ARCHIVES', rowsToKeep.length);
     console.log('[ArchiveWorker] ✅ Archives cleanup: removed ' + deletedCount + ' rows older than ' + cutoffDate);
     return deletedCount;

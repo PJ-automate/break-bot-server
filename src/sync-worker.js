@@ -9,11 +9,15 @@
 
 const db = require('./break-db');
 const CONFIG = require('./config');
-const { breakAppendRow, breakUpdateRange, updateRange, getOrCreateSheet, formatDate, getBreakSheetId, reapplyBreakNumberFormats } = require('./google');
+const { breakAppendRow, breakUpdateRange, updateRange, readRange, getOrCreateSheet, formatDate, getBreakSheetId, reapplyBreakNumberFormats } = require('./google');
 
 const SYNC_TIMEOUT = 120000; // 120s — OVH France has high latency to Google APIs
 var processing = false;
 var SH = CONFIG.breakSheetId;
+
+// Reconcile throttle: reverse-sync GS → SQLite at most once per 60s
+var lastReconcileTime = 0;
+const RECONCILE_INTERVAL = 60000;
 
 /**
  * Race a promise against a timeout.
@@ -157,6 +161,17 @@ async function processSyncQueue() {
   }
 
   processing = false;
+
+  // Reverse-sync: check if any active breaks in SQLite were manually ended via GS Break Tools
+  // Runs at most once every 60s to avoid excessive API calls.
+  if (Date.now() - lastReconcileTime > RECONCILE_INTERVAL) {
+    lastReconcileTime = Date.now();
+    try {
+      await reconcileActiveBreaks();
+    } catch (rcErr) {
+      console.warn('[SyncWorker] Reconcile warning (non-blocking): ' + rcErr.message);
+    }
+  }
 }
 
 /**
@@ -307,6 +322,85 @@ async function trackOverbreakViolation(item) {
   } catch (err) {
     // Non-critical — don't let it affect the main sync flow
     console.warn('[SyncWorker] trackOverbreakViolation failed:', err.message);
+  }
+}
+
+// ============================================================
+//  REVERSE SYNC: Reconcile breaks ended via GS Break Tools
+// ============================================================
+
+/**
+ * Reverse-sync: Check if any breaks that are ON BREAK in SQLite have been
+ * manually ended in Google Sheets (via Break Tools or direct editing).
+ * If found, update SQLite to match the sheet.
+ *
+ * Lightweight version — only reads columns M (status) and N (break_id)
+ * from the sheet to minimize API overhead.
+ */
+async function reconcileActiveBreaks() {
+  // Get all active breaks from SQLite
+  var activeBreaks = db.getAllActiveBreaks();
+  if (!activeBreaks || activeBreaks.length === 0) return;
+
+  // Read only columns M (status) and N (break_id) from CS BREAK
+  var data;
+  try {
+    data = await withTimeout(readRange(SH, 'CS BREAK!M:N'), 30000, 'reconcileRead');
+  } catch (e) {
+    return; // Silently skip on timeout — will retry next cycle
+  }
+  if (!data || data.length < 2) return;
+
+  // Build break_id → sheet status map
+  var sheetMap = {};
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (row && row[1]) { // column N = index 1 in M:N range
+      sheetMap[String(row[1]).trim()] = { status: String(row[0] || '').trim(), sheetRow: i + 1 };
+    }
+  }
+
+  var reconciled = 0;
+  for (var b = 0; b < activeBreaks.length; b++) {
+    var br = activeBreaks[b];
+    var match = sheetMap[br.break_id];
+    if (!match) continue;
+
+    var sheetStatus = match.status;
+    // Sheet shows ended but SQLite says active → reconcile
+    if (sheetStatus.indexOf('RETURNED') >= 0 || sheetStatus.indexOf('OVERBREAK') >= 0 || sheetStatus.indexOf('LONG BREAK') >= 0) {
+      try {
+        // Read the full row data for this break
+        var fullRowRes = await withTimeout(readRange(SH, 'CS BREAK!A' + match.sheetRow + ':O' + match.sheetRow), 15000, 'reconcileFullRead');
+        if (!fullRowRes || !fullRowRes[0]) continue;
+        var fullRow = fullRowRes[0];
+
+        var endTime = String(fullRow[6] || '').trim();
+        var durationHMS = String(fullRow[7] || '').trim();
+        var remaining = String(fullRow[8] || '').trim();
+        var remark = String(fullRow[9] || '').trim();
+        var totalUsed = String(fullRow[11] || '').trim();
+
+        var durParts = durationHMS.split(':').map(Number);
+        var durSecs = (durParts[0] || 0) * 3600 + (durParts[1] || 0) * 60 + (durParts[2] || 0);
+
+        db.getDB().prepare(`
+          UPDATE breaks SET end_time = ?, duration_hms = ?, duration_secs = ?,
+            remaining = ?, remark = ?, total_used_hms = ?, google_sheet_row = ?,
+            status = 'ENDED', sync_status = 'synced'
+          WHERE id = ? AND status = 'ON BREAK'
+        `).run(endTime, durationHMS, durSecs, remaining, remark, totalUsed, match.sheetRow, br.id);
+
+        reconciled++;
+        console.log('[SyncWorker] ✓ Reconciled #' + br.id + ' ' + br.user_name + ' (' + br.break_type + ') → ' + sheetStatus + ' end:' + endTime);
+      } catch (e) {
+        console.warn('[SyncWorker] Reconcile row read failed for #' + br.id + ': ' + e.message);
+      }
+    }
+  }
+
+  if (reconciled > 0) {
+    console.log('[SyncWorker] ✅ Reverse-sync complete: ' + reconciled + ' break(s) reconciled from GS to SQLite');
   }
 }
 

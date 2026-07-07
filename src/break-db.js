@@ -241,15 +241,27 @@ function getActiveBreak(userId) {
  * Pass '__ALL__' as userId to get all users' breaks for today.
  * @returns {Array}
  */
-function getTodayHistory(userId) {
+function getTodayHistory(userId, shiftPeriod) {
   const d = getDB();
   var now = new Date();
   var today = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
 
   if (userId === '__ALL__') {
+    if (shiftPeriod) {
+      return d.prepare(`
+        SELECT * FROM breaks WHERE business_date = ? AND shift_period = ? ORDER BY start_time ASC
+      `).all(today, shiftPeriod);
+    }
     return d.prepare(`
       SELECT * FROM breaks WHERE business_date = ? ORDER BY start_time ASC
     `).all(today);
+  }
+
+  if (shiftPeriod) {
+    return d.prepare(`
+      SELECT * FROM breaks WHERE user_id = ? AND business_date = ? AND shift_period = ?
+      ORDER BY id ASC
+    `).all(userId, today, shiftPeriod);
   }
 
   return d.prepare(`

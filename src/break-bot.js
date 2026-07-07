@@ -967,18 +967,19 @@ async function updateDailySummary(date, user, shift, period, totalUsed, remainin
 // ============================================================
 
 async function sendUserHistory(chatId, userId, userName) {
-  // INSTANT: read from SQLite — no network I/O
-  var breaks = db.getTodayHistory(userId);
-
-  if (!breaks || breaks.length === 0) {
-    return sendMsg(chatId, `👤 *${userName}*\n\n_No breaks recorded today._`);
-  }
-
   // Auto-detect shift period from current PH time (not from stored DB value)
   var phComponents = getPHComponents(new Date());
   var today = formatYMD(phComponents.year, phComponents.month, phComponents.day);
   var phHour = phComponents.hour;
   var correctPeriod = (phHour >= 12) ? 'DayShift' : 'NightShift';
+
+  // INSTANT: read from SQLite — no network I/O
+  // Filter by current shift period so NightShift breaks don't show when on DayShift
+  var breaks = db.getTodayHistory(userId, correctPeriod);
+
+  if (!breaks || breaks.length === 0) {
+    return sendMsg(chatId, `👤 *${userName}*\n\n_No breaks recorded today._`);
+  }
 
   // 12h shift only (8h removed)
   var shiftType = '12h (' + correctPeriod + ')';

@@ -641,6 +641,102 @@ function recalculateSheetRows(rowsToKeep) {
   return count;
 }
 
+// ============================================================
+//  REVERSE SYNC: Reconcile breaks ended via GS Break Tools
+// ============================================================
+
+/**
+ * Reverse-sync: Check if any breaks that are ON BREAK in SQLite have been
+ * manually ended in Google Sheets (via Break Tools or direct editing).
+ * If found, update SQLite to match the sheet.
+ *
+ * This solves the problem where a manager uses the GS Break Tools menu
+ * to end a break, but the Node.js bot still shows it as active because
+ * the bot's SQLite never received the update.
+ *
+ * Runs periodically alongside the archive check (every 15 min).
+ */
+async function reconcileActiveBreaks() {
+  const ts = _logTimestamp();
+  var db = require('./break-db');
+
+  // Get all active breaks from SQLite
+  var activeBreaks = db.getAllActiveBreaks();
+  if (!activeBreaks || activeBreaks.length === 0) return;
+
+  // Read current CS BREAK sheet data (only need columns M, G, H, I, J, L, N)
+  var data;
+  try {
+    data = await readRange(CONFIG.breakSheetId, 'CS BREAK!A:O');
+  } catch (e) {
+    console.warn(ts + ' [ArchiveWorker] Reconcile read error: ' + e.message);
+    return;
+  }
+  if (!data || data.length < 2) return;
+
+  // Build break_id → sheet row map
+  var sheetMap = {};
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (row && row[13]) {
+      sheetMap[String(row[13]).trim()] = { sheetRow: i + 1, data: row };
+    }
+  }
+
+  var reconciled = 0;
+  for (var b = 0; b < activeBreaks.length; b++) {
+    var br = activeBreaks[b];
+    var match = sheetMap[br.break_id];
+    if (!match) continue;
+
+    var sheetStatus = String(match.data[12] || '').trim();
+    // Sheet shows ended but SQLite says active → reconcile
+    if (sheetStatus.indexOf('RETURNED') >= 0 || sheetStatus.indexOf('OVERBREAK') >= 0 || sheetStatus.indexOf('LONG BREAK') >= 0) {
+      var endTime = String(match.data[6] || '').trim();
+      var durationHMS = String(match.data[7] || '').trim();
+      var remaining = String(match.data[8] || '').trim();
+      var remark = String(match.data[9] || '').trim();
+      var totalUsed = String(match.data[11] || '').trim();
+      var sheetRow = match.sheetRow;
+
+      // Parse duration_hms ("0:02:05" or "00:02:05") to seconds
+      var durParts = durationHMS.split(':').map(Number);
+      var durSecs = (durParts[0] || 0) * 3600 + (durParts[1] || 0) * 60 + (durParts[2] || 0);
+
+      try {
+        db.getDB().prepare(`
+          UPDATE breaks SET end_time = ?, duration_hms = ?, duration_secs = ?,
+            remaining = ?, remark = ?, total_used_hms = ?, google_sheet_row = ?,
+            status = 'ENDED', sync_status = 'synced'
+          WHERE id = ? AND status = 'ON BREAK'
+        `).run(endTime, durationHMS, durSecs, remaining, remark, totalUsed, sheetRow, br.id);
+
+        // Also update daily_summary_cache
+        var shiftKey = br.shift_type + ' (' + br.shift_period + ')';
+        try {
+          db.getDB().prepare(`
+            INSERT INTO daily_summary_cache (business_date, user_name, shift_key, sheet_row, total_used, remaining)
+            VALUES (?, ?, ?, -1, ?, ?)
+            ON CONFLICT(business_date, user_name, shift_key) DO UPDATE SET
+              total_used = excluded.total_used, remaining = excluded.remaining,
+              updated_at = datetime('now', 'localtime')
+          `).run(br.business_date, br.user_name, shiftKey, totalUsed, remaining);
+        } catch (dsErr) {}
+
+        reconciled++;
+        console.log(ts + ' [ArchiveWorker] ✓ Reconciled #' + br.id + ' ' + br.user_name +
+          ' (sheet: ' + sheetStatus + ' end:' + endTime + ' dur:' + durationHMS + ')');
+      } catch (updateErr) {
+        console.warn(ts + ' [ArchiveWorker] Reconcile update failed for #' + br.id + ': ' + updateErr.message);
+      }
+    }
+  }
+
+  if (reconciled > 0) {
+    console.log(ts + ' [ArchiveWorker] ✅ Reverse-sync complete: ' + reconciled + ' break(s) reconciled from GS to SQLite');
+  }
+}
+
 /**
  * Count how many rows in CS BREAK have dates before today.
  * Used to trigger archive outside the midnight window (e.g. after PM2 restart).
@@ -691,6 +787,13 @@ async function scheduledCheck() {
       await autoCloseStaleBreaks();
     } catch (acErr) {
       console.warn(ts + ' [ArchiveWorker] Auto-close check warning: ' + acErr.message);
+    }
+
+    // Reverse-sync: reconcile breaks ended via GS Break Tools but still ON BREAK in SQLite
+    try {
+      await reconcileActiveBreaks();
+    } catch (rcErr) {
+      console.warn(ts + ' [ArchiveWorker] Reconcile warning: ' + rcErr.message);
     }
 
     // Skip if already successfully archived today

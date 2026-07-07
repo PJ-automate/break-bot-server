@@ -924,7 +924,7 @@ async function updateDailySummary(date, user, shift, period, totalUsed, remainin
 
   // PHASE 1: Check SQLite cache — instant, no network I/O
   var cached = db.getSummaryCache(date, user, shiftKey);
-  if (cached && cached.sheet_row > 0) {
+  if (cached && cached.sheet_row > 1) { // >1 to skip header row (row 1)
     try {
       await withTimeout(breakUpdateRange(SH, 'DAILY SUMMARY!C' + cached.sheet_row + ':E' + cached.sheet_row, [[
         shiftKey, totalUsed, remaining
@@ -948,10 +948,12 @@ async function updateDailySummary(date, user, shift, period, totalUsed, remainin
     if (appendResult && appendResult.updates && appendResult.updates.updatedRange) {
       var match = appendResult.updates.updatedRange.match(/A(\d+):/);
       var newRow = match ? parseInt(match[1], 10) : 0;
-      if (newRow > 0) {
+      if (newRow > 1) { // >1 to skip header row
         db.setSummaryCache(date, user, shiftKey, newRow, totalUsed, remaining);
         console.log('[DS] Appended new row ' + newRow + ' for ' + user);
         return;
+      } else {
+        console.warn('[DS] Skipped cache for row ' + newRow + ' (header row)');
       }
     }
     console.log('[DS] Append completed for ' + user + ' but could not determine row');

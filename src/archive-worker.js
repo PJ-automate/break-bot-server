@@ -243,7 +243,11 @@ async function runArchive() {
 
     for (var i = 1; i < data.length; i++) {
       var row = data[i];
-      if (!row || !row[0]) { rowsToKeep.push(row); continue; } // No date = keep
+      // Skip completely empty rows (all blank cells) — don't preserve them
+      if (!row || row.every(function(cell) { return !cell && cell !== 0; })) continue;
+
+      // Rows with no date value get archived (they're incomplete/error rows)
+      if (!row[0]) { rowsToMove.push(row); continue; }
 
       // Normalize date to YYYY-MM-DD for comparison
       var rowDateStr = cellToDateStr(row[0]);
@@ -315,50 +319,53 @@ async function runArchive() {
       await breakUpdateRange(ssId, "'CS BREAK'!A1:O" + rowsToKeep.length, rowsToKeep);
       console.log(ts + ' [ArchiveWorker] ✓ Rewrote CS BREAK with ' + rowsToKeep.length + ' rows (RAW mode)');
 
-      // Delete rows beyond what we wrote (cleaner than writing empties)
+      // Delete rows beyond what we wrote — removes old data from the grid
       try {
-        // Only attempt cleanup if there are data rows beyond the header
-        // Google Sheets does NOT allow deleting ALL non-frozen rows
-        if (rowsToKeep.length > 1) {
-          var gsheets2 = google.sheets({
-            version: "v4",
-            auth: new google.auth.GoogleAuth({
-              credentials: key,
-              scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-            })
-          });
-          var ssInfo = await gsheets2.spreadsheets.get({ spreadsheetId: ssId });
-          var csSheet = ssInfo.data.sheets.find(function(s) { return s.properties.title === "CS BREAK"; });
-          if (csSheet) {
-            var totalRows = csSheet.properties.gridProperties.rowCount || 1000;
-            var rowsToDelete = totalRows - rowsToKeep.length;
-            if (rowsToDelete > 0 && rowsToDelete < totalRows - 1) { // safety: leave at least 1 data row
-              await gsheets2.spreadsheets.batchUpdate({
-                spreadsheetId: ssId,
-                requestBody: {
-                  requests: [{
-                    deleteDimension: {
-                      range: {
-                        sheetId: csSheet.properties.sheetId,
-                        dimension: "ROWS",
-                        startIndex: rowsToKeep.length,
-                        endIndex: totalRows
-                      }
+        var gsheets2 = google.sheets({
+          version: "v4",
+          auth: new google.auth.GoogleAuth({
+            credentials: key,
+            scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+          })
+        });
+        var ssInfo = await gsheets2.spreadsheets.get({ spreadsheetId: ssId });
+        var csSheet = ssInfo.data.sheets.find(function(s) { return s.properties.title === "CS BREAK"; });
+        if (csSheet) {
+          var totalRows = csSheet.properties.gridProperties.rowCount || 1000;
+          var startDelete = rowsToKeep.length; // delete from first row past kept data
+
+          // Safety: never delete row 0 (header), and only delete if there are rows to remove
+          if (startDelete < totalRows) {
+            // Google Sheets requires at least 1 non-frozen row; if only header remains,
+            // delete from row 1 (0-indexed) which is row 2 in the sheet UI.
+            // This leaves the header (row 0) intact.
+            if (startDelete < 1) startDelete = 1;
+
+            await gsheets2.spreadsheets.batchUpdate({
+              spreadsheetId: ssId,
+              requestBody: {
+                requests: [{
+                  deleteDimension: {
+                    range: {
+                      sheetId: csSheet.properties.sheetId,
+                      dimension: "ROWS",
+                      startIndex: startDelete,
+                      endIndex: totalRows
                     }
-                  }]
-                }
-              });
-              console.log(ts + ' [ArchiveWorker] ✓ Deleted ' + rowsToDelete + ' excess rows from CS BREAK (kept ' + rowsToKeep.length + ')');
-            }
+                  }
+                }]
+              }
+            });
+            console.log(ts + ' [ArchiveWorker] ✓ Deleted ' + (totalRows - startDelete) + ' excess rows from CS BREAK (kept ' + rowsToKeep.length + ')');
           }
-        } else {
-          console.log(ts + ' [ArchiveWorker] Skipped row cleanup — only header remains in CS BREAK');
-          // Clear residual data in row 2 so old July 5 rows don't show in the sheet UI
-          await breakUpdateRange(ssId, "'CS BREAK'!A2:O2", [[ '','','','','','','','','','','','','','','' ]]);
-          console.log(ts + ' [ArchiveWorker] ✓ Cleared residual data in row 2 (header-only sheet)');
         }
       } catch(e) {
         console.warn(ts + ' [ArchiveWorker] Row cleanup warning (non-fatal): ' + e.message);
+        // Fallback: clear residual data if delete fails
+        try {
+          await breakUpdateRange(ssId, "'CS BREAK'!A2:O1000", Array(999).fill(['','','','','','','','','','','','','','','']));
+          console.log(ts + ' [ArchiveWorker] ✓ Fallback: cleared rows 2-1000 via empty write');
+        } catch(e2) {}
       }
     }
 
@@ -503,6 +510,8 @@ async function cleanupDailySummary(ssId) {
 
     if (deletedCount === 0) return 0;
 
+    // Always enforce correct header — prevents data from corrupting row 1
+    rowsToKeep[0] = ['Date','User','Shift','Total Used','Remaining'];
     normalizeDates(rowsToKeep);
     await breakUpdateRange(ssId, "'DAILY SUMMARY'!A1:E" + rowsToKeep.length, rowsToKeep);
     await deleteExcessRows(ssId, 'DAILY SUMMARY', rowsToKeep.length);

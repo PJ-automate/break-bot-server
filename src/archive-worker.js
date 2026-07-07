@@ -83,6 +83,9 @@ function _logTimestamp() {
 let lastArchivedDate = null;
 let running = false;
 
+// Track whether auto-close already ran today (runs once per day to avoid redundant SQLite writes)
+let autoCloseToday = '';
+
 /**
  * Get today's date in PH time as YYYY-MM-DD string.
  */
@@ -187,6 +190,16 @@ async function runArchive() {
     if (!ssId) throw new Error('breakSheetId not configured');
 
     const todayStr = getPHDateStr();
+
+    // ============================================================
+    //  STEP 0: Auto-close stale breaks from previous business dates
+    //  Run BEFORE archive so ended breaks get archived correctly.
+    // ============================================================
+    try {
+      await autoCloseStaleBreaks();
+    } catch (acErr) {
+      console.warn(ts + ' [ArchiveWorker] Auto-close warning (non-fatal): ' + acErr.message);
+    }
     // Restore lastArchivedDate from SQLite (persists across PM2 restarts)
     try {
       var db = require('./break-db');
@@ -347,6 +360,18 @@ async function runArchive() {
       } catch(e) {
         console.warn(ts + ' [ArchiveWorker] Row cleanup warning (non-fatal): ' + e.message);
       }
+    }
+
+    // ============================================================
+    //  RECALCULATE google_sheet_row for all kept breaks
+    //  After archive rewrites CS BREAK, the old row numbers in SQLite
+    //  are stale. This updates them to match the new positions.
+    // ============================================================
+    try {
+      var rowCount = recalculateSheetRows(rowsToKeep);
+      console.log(ts + ' [ArchiveWorker] ✓ Recalculated google_sheet_row for ' + rowCount + ' breaks');
+    } catch (recalcErr) {
+      console.warn(ts + ' [ArchiveWorker] Row recalculation warning (non-fatal): ' + recalcErr.message);
     }
 
     // ============================================================
@@ -529,6 +554,93 @@ async function cleanupArchives(ssId) {
   }
 }
 
+// ============================================================
+//  AUTO-CLOSE: End stale ON BREAK records from previous days
+// ============================================================
+
+/**
+ * Auto-close breaks that are still ON BREAK from previous business dates.
+ * These breaks were never ended via /end command and are still marked
+ * as active in SQLite. The GS rows have already been archived.
+ *
+ * This runs before archive to ensure:
+ *  1. Dashboard stops showing them as active
+ *  2. Archive moves the completed breaks to ARCHIVES
+ *  3. Total used is properly calculated for the correct business date
+ *
+ * Uses endBreakAuto() which does NOT queue a GS sync (rows already archived).
+ */
+async function autoCloseStaleBreaks() {
+  const ts = _logTimestamp();
+  const todayStr = getPHDateStr();
+
+  // Skip if already ran today
+  if (autoCloseToday === todayStr) return;
+
+  var db = require('./break-db');
+  var staleBreaks = db.getStaleActiveBreaks(todayStr);
+
+  if (!staleBreaks || staleBreaks.length === 0) {
+    autoCloseToday = todayStr;
+    return;
+  }
+
+  console.log(ts + ' [ArchiveWorker] Auto-closing ' + staleBreaks.length + ' stale break(s) from previous date(s)...');
+
+  for (var i = 0; i < staleBreaks.length; i++) {
+    var b = staleBreaks[i];
+    try {
+      // Close at 23:59:59 of the business date (end of shift)
+      var result = db.endBreakAuto(b, '23:59:59');
+      if (result) {
+        console.log(ts + ' [ArchiveWorker] ✓ Auto-closed #' + b.id + ' ' + b.user_name + ' (' + b.break_type + ' ' + b.start_time + ') → ' + result.curHMS + ' ' + (result.remark || ''));
+      }
+    } catch (err) {
+      console.warn(ts + ' [ArchiveWorker] Auto-close failed for #' + b.id + ': ' + err.message);
+    }
+  }
+
+  autoCloseToday = todayStr;
+  console.log(ts + ' [ArchiveWorker] Auto-close complete. Closed ' + staleBreaks.length + ' stale break(s).');
+}
+
+// ============================================================
+//  ROW RECALCULATION: Fix stale google_sheet_row after archive
+// ============================================================
+
+/**
+ * After archive rewrites CS BREAK with only today's rows, the
+ * google_sheet_row values in SQLite are stale (they pointed to
+ * pre-archive positions). This function recalculates them by
+ * matching break_id (column N) with the new row positions.
+ *
+ * @param {Array} rowsToKeep — rows that remain in CS BREAK after archive
+ * @returns {number} count of rows updated
+ */
+function recalculateSheetRows(rowsToKeep) {
+  var db = require('./break-db');
+  var count = 0;
+
+  // rowsToKeep[0] = header, data starts at rowsToKeep[1]
+  // Sheet row = index + 1 (1-indexed, row 1 = header)
+  for (var i = 1; i < rowsToKeep.length; i++) {
+    var row = rowsToKeep[i];
+    if (!row || !row[13]) continue; // column N = break_id
+    var breakId = String(row[13]).trim();
+    if (!breakId) continue;
+    var sheetRow = i + 1; // sheet row number
+
+    try {
+      db.updateSheetRow(breakId, sheetRow);
+      count++;
+    } catch (e) {
+      // Break might not exist in SQLite (legacy/migrated data)
+    }
+  }
+
+  return count;
+}
+
 /**
  * Count how many rows in CS BREAK have dates before today.
  * Used to trigger archive outside the midnight window (e.g. after PM2 restart).
@@ -573,6 +685,13 @@ async function scheduledCheck() {
   try {
     const { hours, minutes, dateStr } = getPHTimeComponents();
     const ts = _logTimestamp();
+
+    // Run auto-close for stale breaks from previous days (guarded internally by autoCloseToday)
+    try {
+      await autoCloseStaleBreaks();
+    } catch (acErr) {
+      console.warn(ts + ' [ArchiveWorker] Auto-close check warning: ' + acErr.message);
+    }
 
     // Skip if already successfully archived today
     if (lastArchivedDate === dateStr) {

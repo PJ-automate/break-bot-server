@@ -462,6 +462,103 @@ function importSummaryCacheFromSheet(sheetData) {
   }
   return count;
 }
+/**
+ * End a break by its database ID (used for auto-close of stale breaks).
+ * Unlike endBreak(), this does NOT queue a Google Sheets sync because
+ * the GS row was already archived. Sets sync_status = 'synced' directly.
+ * @returns {object|null} { id, breakType, curHMS, totalHMS, remHMS, remark }
+ */
+function endBreakAuto(activeBreakRow, endTimeStr) {
+  const d = getDB();
+  if (!activeBreakRow || activeBreakRow.status !== 'ON BREAK') return null;
+
+  // Calculate duration from start_time to end_time
+  var startParts = activeBreakRow.start_time.split(':').map(Number);
+  var endParts = endTimeStr.split(':').map(Number);
+  var startSecs = startParts[0] * 3600 + startParts[1] * 60 + (startParts[2] || 0);
+  var endSecs = endParts[0] * 3600 + endParts[1] * 60 + (endParts[2] || 0);
+  var diffSecs = endSecs - startSecs;
+  if (diffSecs < 0) diffSecs += 86400; // crossed midnight
+
+  var durH = Math.floor(diffSecs / 3600);
+  var durM = Math.floor((diffSecs % 3600) / 60);
+  var durS = diffSecs % 60;
+  var curHMS = pad2(durH) + ':' + pad2(durM) + ':' + pad2(durS);
+
+  // Calculate previous total from ended breaks on same business date
+  var prevTotal = d.prepare(`
+    SELECT COALESCE(SUM(duration_secs), 0) as total FROM breaks
+    WHERE user_id = ? AND business_date = ? AND status != 'ON BREAK'
+  `).get(activeBreakRow.user_id, activeBreakRow.business_date);
+  var prevSecs = prevTotal ? prevTotal.total : 0;
+
+  var totalSecs = prevSecs + diffSecs;
+  var allowance = 7200; // 2 hours (12h shift)
+  var remaining = allowance - totalSecs;
+  var remHMS = (remaining > 0 ? '' : '-') +
+    pad2(Math.floor(Math.abs(remaining) / 3600)) + 'h ' +
+    pad2(Math.floor((Math.abs(remaining) % 3600) / 60)) + 'm';
+
+  var totalH = Math.floor(totalSecs / 3600);
+  var totalM = Math.floor((totalSecs % 3600) / 60);
+  var totalS = totalSecs % 60;
+  var totalHMS = pad2(totalH) + ':' + pad2(totalM) + ':' + pad2(totalS);
+
+  var remark = '';
+  if (diffSecs > 3600) remark = 'LONG BREAK';
+  if (totalSecs > allowance) remark = 'OVERBREAK';
+
+  // Update break record — sync_status = 'synced' (no GS sync since row was archived)
+  d.prepare(`
+    UPDATE breaks SET end_time = ?, duration_secs = ?, duration_hms = ?,
+      remaining = ?, remark = ?, total_used_hms = ?, status = 'ENDED',
+      sync_status = 'synced'
+    WHERE id = ?
+  `).run(endTimeStr, diffSecs, curHMS, remHMS, remark, totalHMS, activeBreakRow.id);
+
+  // Update daily_summary_cache
+  var shiftKey = activeBreakRow.shift_type + ' (' + activeBreakRow.shift_period + ')';
+  d.prepare(`
+    INSERT INTO daily_summary_cache (business_date, user_name, shift_key, sheet_row, total_used, remaining)
+    VALUES (?, ?, ?, -1, ?, ?)
+    ON CONFLICT(business_date, user_name, shift_key) DO UPDATE SET
+      total_used = excluded.total_used, remaining = excluded.remaining,
+      updated_at = datetime('now', 'localtime')
+  `).run(activeBreakRow.business_date, activeBreakRow.user_name, shiftKey, totalHMS, remHMS);
+
+  return {
+    id: activeBreakRow.id,
+    breakType: activeBreakRow.break_type,
+    curHMS: curHMS,
+    totalHMS: totalHMS,
+    remHMS: remHMS,
+    remark: remark
+  };
+}
+
+/** Helper: zero-pad a number to 2 digits */
+function pad2(n) { return String(Math.floor(n)).padStart(2, '0'); }
+
+/**
+ * Update the google_sheet_row for a break identified by break_id.
+ * Called after archive to correct stale row numbers.
+ */
+function updateSheetRow(breakId, sheetRow) {
+  const d = getDB();
+  d.prepare("UPDATE breaks SET google_sheet_row = ? WHERE break_id = ?").run(sheetRow, breakId);
+}
+
+/**
+ * Get all ON BREAK breaks from previous business dates (for auto-close).
+ * @returns {Array}
+ */
+function getStaleActiveBreaks(todayStr) {
+  const d = getDB();
+  return d.prepare(`
+    SELECT * FROM breaks WHERE status = 'ON BREAK' AND business_date < ?
+  `).all(todayStr);
+}
+
 function closeDB() {
   if (db) { db.close(); db = null; }
 }
@@ -493,5 +590,6 @@ module.exports = {
   getAllActiveBreaks, importFromSheetData,
   getSummaryCache, setSummaryCache, getSummaryCacheByDate,
   clearSummaryCache, importSummaryCacheFromSheet,
-  getSetting, setSetting
+  getSetting, setSetting,
+  endBreakAuto, updateSheetRow, getStaleActiveBreaks
 };

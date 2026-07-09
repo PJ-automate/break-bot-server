@@ -266,10 +266,8 @@ async function archiveOldData() {
     await updateRange(SH, archRange, oldRows);
     console.log('[Archive] Archived ' + (oldRows.length - 1) + ' rows');
 
-    // Apply professional formatting to Archives if newly created
-    if (archCreated.created) {
-      try { await formatBreakSheets(SH); } catch (e) { console.error('[Archive] Format error:', e.message); }
-    }
+    // Apply professional formatting to all sheets (fixes data rows that inherited header styling)
+    try { await formatBreakSheets(SH); } catch (e) { console.error('[Archive] Format error:', e.message); }
 
     // Batch 2: Clear all old rows from CS BREAK, rewrite today rows
     var clearPayload = [];
@@ -376,10 +374,8 @@ async function getBreakSheet() {
     anyCreated = true;
   }
 
-  // If any sheet was new, apply professional formatting
-  if (anyCreated) {
-    try { await formatBreakSheets(SH); } catch (err) { console.error('[BreakBot] Formatting error:', err.message); }
-  }
+  // Apply professional formatting on first run (fixes data rows that inherited header styling)
+  try { await formatBreakSheets(SH); } catch (err) { console.error('[BreakBot] Formatting error:', err.message); }
 
   BREAK_SHEETS_READY = true; // Cache: skip API calls on next interaction
   return { breakSheet: 'CS BREAK', summarySheet: 'DAILY SUMMARY' };

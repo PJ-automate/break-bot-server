@@ -242,7 +242,8 @@ async function breakAppendRow(spreadsheetId, range, values) {
       const res = await sheets.spreadsheets.values.append({
         spreadsheetId, range,
         valueInputOption: 'RAW',
-        insertDataOption: 'INSERT_ROWS',
+        // NOT using INSERT_ROWS — that creates new rows inheriting header formatting (dark bg, bold).
+        // Without it, data fills existing empty grid cells which have proper data formatting (white bg, not bold).
         requestBody: { values: requestValues }
       });
       return res.data;

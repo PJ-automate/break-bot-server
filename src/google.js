@@ -359,14 +359,19 @@ async function formatBreakSheets(spreadsheetId) {
     const name = sheet.properties.title;
     const sheetId = sheet.properties.sheetId;
 
-    if (name === 'CS BREAK') {
-      await formatCSBreakSheet(ss, spreadsheetId, sheetId);
-    } else if (name.toUpperCase() === 'ARCHIVES') {
-      await formatArchivesSheet(ss, spreadsheetId, sheetId);
-    } else if (name === 'DAILY SUMMARY') {
-      await formatDailySummarySheet(ss, spreadsheetId, sheetId);
-    } else if (name === 'OVERBREAK_TRACKER') {
-      await formatOverbreakSheet(ss, spreadsheetId, sheetId);
+    try {
+      if (name === 'CS BREAK') {
+        await formatCSBreakSheet(ss, spreadsheetId, sheetId);
+      } else if (name.toUpperCase() === 'ARCHIVES') {
+        await formatArchivesSheet(ss, spreadsheetId, sheetId);
+      } else if (name === 'DAILY SUMMARY') {
+        await formatDailySummarySheet(ss, spreadsheetId, sheetId);
+      } else if (name === 'OVERBREAK_TRACKER') {
+        await formatOverbreakSheet(ss, spreadsheetId, sheetId);
+      }
+      console.log('[Format] ' + name + ' formatted successfully');
+    } catch (sheetErr) {
+      console.warn('[Format] ' + name + ' formatting failed (continuing to next sheet):', sheetErr.message);
     }
   }
 }

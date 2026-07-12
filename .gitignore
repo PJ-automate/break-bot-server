@@ -3,3 +3,9 @@ node_modules/
 break-bot-key.json
 data/
 Key JSON/
+*_temp.js
+end_nightshift_temp.js
+fix_reader_temp.js
+fix_timezone_temp.js
+fix_token_remaining.js
+remove_condition5.js

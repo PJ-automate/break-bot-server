@@ -1111,9 +1111,10 @@ async function getDashboardData() {
         totalUsed: fmtHMS(d.totalSeconds),
         totalSeconds: d.totalSeconds,
         totalAllowed: fmtHMS(d.allowanceSeconds),
-        remaining: remaining > 0
-          ? String(Math.floor(remaining / 3600)).padStart(2, '0') + 'h ' + String(Math.floor((remaining % 3600) / 60)).padStart(2, '0') + 'm'
-          : String(Math.floor(Math.abs(remaining) / 3600)).padStart(2, '0') + 'h ' + String(Math.floor((Math.abs(remaining) % 3600) / 60)).padStart(2, '0') + 'm',
+        remaining: (remaining >= 0 ? '' : '-') +
+          String(Math.floor(Math.abs(remaining) / 3600)).padStart(2, '0') + ':' +
+          String(Math.floor((Math.abs(remaining) % 3600) / 60)).padStart(2, '0') + ':' +
+          String(Math.abs(remaining) % 60).padStart(2, '0'),
         overBreak: d.totalSeconds > d.allowanceSeconds
       };
     });

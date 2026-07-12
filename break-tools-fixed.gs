@@ -322,7 +322,7 @@ function showManualEndBreak() {
 
   var finalTotal = prevSecs + durSecs;
   var rem = allowance - finalTotal;
-  var remStr = rem >= 0 ? '✅ ' + formatSecsToHMS(rem) : '⚠️ Over: -' + formatSecsToHMS(Math.abs(rem));
+  var remStr = rem >= 0 ? formatSecsToHMS(rem) : '-' + formatSecsToHMS(Math.abs(rem));
 
   var remark = '';
   if (durSecs > 3600) remark = 'LONG BREAK';
@@ -482,7 +482,7 @@ function recalcDailySummary() {
     var totalHere = runningTotals[kk];
     var remHere = allowance2 - totalHere;
     totalBatch.push([formatSecsToHMS(totalHere)]);
-    remBatch.push([remHere >= 0 ? '✅ ' + formatSecsToHMS(remHere) : '⚠️ Over: -' + formatSecsToHMS(Math.abs(remHere))]);
+    remBatch.push([remHere >= 0 ? formatSecsToHMS(remHere) : '-' + formatSecsToHMS(Math.abs(remHere))]);
     todayCount++;
   }
 

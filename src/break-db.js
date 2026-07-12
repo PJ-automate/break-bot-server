@@ -171,9 +171,10 @@ function endBreak(userId, endTimeStr) {
   var totalSecs = prevSecs + diffSecs;
   var allowance = 7200; // 2 hours (12h shift only, 8h removed)
   var remaining = allowance - totalSecs;
-  var remHMS = (remaining > 0 ? '' : '-') +
-    String(Math.floor(Math.abs(remaining) / 3600)).padStart(2, '0') + 'h ' +
-    String(Math.floor((Math.abs(remaining) % 3600) / 60)).padStart(2, '0') + 'm';
+  var remHMS = (remaining >= 0 ? '' : '-') +
+    String(Math.floor(Math.abs(remaining) / 3600)).padStart(2, '0') + ':' +
+    String(Math.floor((Math.abs(remaining) % 3600) / 60)).padStart(2, '0') + ':' +
+    String(Math.abs(remaining) % 60).padStart(2, '0');
 
   var totalH = Math.floor(totalSecs / 3600);
   var totalM = Math.floor((totalSecs % 3600) / 60);
@@ -507,9 +508,10 @@ function endBreakAuto(activeBreakRow, endTimeStr) {
   var totalSecs = prevSecs + diffSecs;
   var allowance = 7200; // 2 hours (12h shift)
   var remaining = allowance - totalSecs;
-  var remHMS = (remaining > 0 ? '' : '-') +
-    pad2(Math.floor(Math.abs(remaining) / 3600)) + 'h ' +
-    pad2(Math.floor((Math.abs(remaining) % 3600) / 60)) + 'm';
+  var remHMS = (remaining >= 0 ? '' : '-') +
+    pad2(Math.floor(Math.abs(remaining) / 3600)) + ':' +
+    pad2(Math.floor((Math.abs(remaining) % 3600) / 60)) + ':' +
+    pad2(Math.abs(remaining) % 60);
 
   var totalH = Math.floor(totalSecs / 3600);
   var totalM = Math.floor((totalSecs % 3600) / 60);

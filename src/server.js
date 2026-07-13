@@ -84,6 +84,19 @@ app.get('/set-break-webhook', async (req, res) => {
 });
 
 // ============================================================
+//  FORCE FORMAT RE-APPLY
+// ============================================================
+app.get('/force-format', async (req, res) => {
+  try {
+    const { formatBreakSheets } = require('./google');
+    await formatBreakSheets(require('./config').breakSheetId);
+    res.json({ status: 'ok', message: 'Formatting re-applied' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
 //  HEALTH CHECK
 // ============================================================
 app.get('/health', (req, res) => {

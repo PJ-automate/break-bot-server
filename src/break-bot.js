@@ -952,6 +952,33 @@ async function updateDailySummary(date, user, shift, period, totalUsed, remainin
         console.warn('[DS] Skipped cache for row ' + newRow + ' (header row)');
       }
     }
+    // Better row detection: handle all failure modes
+    try {
+      var fbRow = 0;
+      if (appendResult && appendResult.updates && appendResult.updates.updatedRange) {
+        // Try multiple regex patterns for robustness
+        var range = appendResult.updates.updatedRange;
+        var m1 = range.match(/[A-Z]+(\d+):/);
+        var m2 = range.match(/[A-Z]+(\d+)$/);
+        if (m1) fbRow = parseInt(m1[1], 10);
+        else if (m2) fbRow = parseInt(m2[1], 10);
+      }
+      if (fbRow < 2) {
+        // Fallback: read last row from sheet
+        var { readRange } = require('./google');
+        var fbData = await withTimeout(readRange(SH, 'DAILY SUMMARY!A:A'), 30000, 'readRange DS fb');
+        if (fbData && fbData.length > 0) {
+          fbRow = fbData.length;
+        }
+      }
+      if (fbRow > 1) {
+        db.setSummaryCache(date, user, shiftKey, fbRow, totalUsed, remaining);
+        console.log('[DS] Cached row ' + fbRow + ' for ' + user);
+        return;
+      }
+    } catch(fbErr) {
+      console.warn('[DS] Row detection fallback failed: ' + fbErr.message);
+    }
     console.log('[DS] Append completed for ' + user + ' but could not determine row');
   } catch (err) {
     console.warn('[DS] Append failed for ' + user + ': ' + err.message);

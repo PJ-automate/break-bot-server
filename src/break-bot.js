@@ -530,11 +530,19 @@ async function handleBreakUpdate(update) {
 
     // Callback query
     if (update.callback_query) {
+      // SILENTLY IGNORE DMs — only group chat commands are accepted
+      if (update.callback_query.message && update.callback_query.message.chat.type === 'private') {
+        return;
+      }
       return handleCallback(update.callback_query);
     }
 
     // Message
     if (update.message) {
+      // SILENTLY IGNORE DMs — only group chat commands are accepted
+      if (update.message.chat && update.message.chat.type === 'private') {
+        return;
+      }
       return handleMessage(update.message);
     }
   } catch (err) {
@@ -1161,7 +1169,52 @@ async function getDashboardData() {
   }
 }
 
+async function getDashboardDataForDate(dateStr) {
+  try {
+    var breaks = require('./break-db').getHistoryByDate(dateStr);
+    if (!breaks || breaks.length === 0) {
+      return { onBreak: [], dailySummary: [], breakHistory: [], violations: [], date: dateStr };
+    }
+    var breakHistory = [];
+    var violations = [];
+    var seenViolationUsers = {};
+    var dailyMap = {};
+    for (var i = 0; i < breaks.length; i++) {
+      var b = breaks[i];
+      if (b.status === 'ENDED' && b.duration_secs > 0) {
+        var remark = b.remark || '';
+        breakHistory.push({ userName: b.user_name, type: b.break_type, start: b.start_time, end: b.end_time, duration: b.duration_hms, remark: remark });
+        if (remark === 'OVERBREAK' || remark === 'LONG BREAK') {
+          var eIdx = seenViolationUsers[b.user_name];
+          if (eIdx === undefined) {
+            seenViolationUsers[b.user_name] = violations.length;
+            violations.push({ userName: b.user_name, type: b.break_type, start: b.start_time, end: b.end_time, duration: b.duration_hms, remark: remark });
+          } else if (remark === 'OVERBREAK' && violations[eIdx].remark !== 'OVERBREAK') {
+            violations[eIdx] = { userName: b.user_name, type: b.break_type, start: b.start_time, end: b.end_time, duration: b.duration_hms, remark: remark };
+          }
+        }
+        var mk = b.user_id + '_' + (b.shift_type || '12h') + '_' + (b.shift_period || 'DayShift');
+        if (!dailyMap[mk]) {
+          dailyMap[mk] = { userName: b.user_name, userId: b.user_id, shift: (b.shift_type || '12h') + ' (' + (b.shift_period || 'DayShift') + ')', totalSeconds: 0, allowanceSeconds: 7200 };
+        }
+        dailyMap[mk].totalSeconds += b.duration_secs;
+      }
+    }
+    function pad2(n){return String(Math.floor(n)).padStart(2,'0');}
+    function fmtHMS(s){var h=Math.floor(s/3600);var m=Math.floor((s%3600)/60);var se=s%60;return h+':'+pad2(m)+':'+pad2(se);}
+    var dailySummary = Object.values(dailyMap).map(function(d) {
+      var remaining = d.allowanceSeconds - d.totalSeconds;
+      return { userName: d.userName, shift: d.shift, totalUsed: fmtHMS(d.totalSeconds), totalSeconds: d.totalSeconds, totalAllowed: fmtHMS(d.allowanceSeconds), remaining: (remaining >= 0 ? '' : '-') + pad2(Math.floor(Math.abs(remaining) / 3600)) + ':' + pad2(Math.floor((Math.abs(remaining) % 3600) / 60)) + ':' + pad2(Math.abs(remaining) % 60), overBreak: d.totalSeconds > d.allowanceSeconds };
+    });
+    return { onBreak: [], dailySummary: dailySummary, breakHistory: breakHistory, violations: violations, violationHistory: violations, date: dateStr };
+  } catch (err) {
+    console.error('[BreakBot] History data error:', err.message);
+    return { onBreak: [], dailySummary: [], breakHistory: [], violations: [], date: dateStr };
+  }
+}
+
 module.exports = {
+  getDashboardDataForDate,
   handleBreakUpdate,
   getDashboardData,
   archiveOldData,

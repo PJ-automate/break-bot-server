@@ -1,5 +1,7 @@
-/**
- * break-db.js — SQLite database for Break Tracker Bot.
+function getHistoryByDate(d,u){u=u||'__ALL__';var p=getDB().prepare(u==='__ALL__'?'SELECT * FROM breaks WHERE business_date = ? ORDER By start_time ASC':'SELECT * FROM breaks WHERE user_id = ? AND business_date = ? ORDER By id ASC');return u==='__ALL__'?p.all(d):p.all(u,d);}
+function getHistoryByDateRange(fr,to,u){u=u||'__ALL__';var s=u==='__ALL__'?'SELECT * FROM breaks WHERE business_date >= ? AND business_date <= ? ORDER BY business_date ASC, start_time ASC':'SELECT * FROM breaks WHERE user_id = ? AND business_date >= ? AND business_date <= ? ORDER BY business_date ASC, start_time ASC';return getDB().prepare(s).all.apply(null,u==='__ALL__'?[fr,to]:[u,fr,to]);}
+﻿/**
+ * break-db.js ??? SQLite database for Break Tracker Bot.
  * Source of truth for all break data. Google Sheets is updated asynchronously.
  */
 'use strict';
@@ -11,7 +13,7 @@ const DB_PATH = path.join(__dirname, '..', 'data', 'break-bot.db');
 let db = null;
 
 /**
- * Initialize the database — creates tables if they don't exist.
+ * Initialize the database ??? creates tables if they don't exist.
  */
 function initDB() {
   var dir = path.dirname(DB_PATH);
@@ -22,7 +24,7 @@ function initDB() {
   db.pragma('journal_mode = WAL');    // Faster writes
   db.pragma('synchronous = NORMAL');  // Good balance of speed/safety
 
-  // Breaks table — all break records
+  // Breaks table ??? all break records
   db.exec(`
     CREATE TABLE IF NOT EXISTS breaks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,7 +49,7 @@ function initDB() {
     )
   `);
 
-  // Daily summary cache — tracks which rows exist in DAILY SUMMARY sheet
+  // Daily summary cache ??? tracks which rows exist in DAILY SUMMARY sheet
   // Eliminates the need to read the full sheet to find matching rows,
   // which was causing 40s timeouts from OVH France to Google APIs.
   db.exec(`
@@ -106,7 +108,7 @@ function getDB() {
 }
 
 /**
- * Start a break — insert record.
+ * Start a break ??? insert record.
  * @returns {object} { id, breakId }
  */
 function startBreak(businessDate, userName, shiftType, shiftPeriod, breakType, startTime, userId) {
@@ -135,7 +137,7 @@ function startBreak(businessDate, userName, shiftType, shiftPeriod, breakType, s
 }
 
 /**
- * End a break — update the active break for a user.
+ * End a break ??? update the active break for a user.
  * @returns {object|null} { row, duration, totalHMS, remHMS, remark } or null if no active break
  */
 function endBreak(userId, endTimeStr) {
@@ -184,7 +186,7 @@ function endBreak(userId, endTimeStr) {
   var remark = '';
   if (diffSecs > 3600) remark = 'LONG BREAK';
   if (totalSecs > allowance) remark = 'OVERBREAK';
-  var statusIcon = remark ? ('⚠️ ' + remark) : '🟢 RETURNED';
+  var statusIcon = remark ? ('?????? ' + remark) : '???? RETURNED';
 
   // Update the break record
   d.prepare(`
@@ -522,7 +524,7 @@ function endBreakAuto(activeBreakRow, endTimeStr) {
   if (diffSecs > 3600) remark = 'LONG BREAK';
   if (totalSecs > allowance) remark = 'OVERBREAK';
 
-  // Update break record — sync_status = 'synced' (no GS sync since row was archived)
+  // Update break record ??? sync_status = 'synced' (no GS sync since row was archived)
   d.prepare(`
     UPDATE breaks SET end_time = ?, duration_secs = ?, duration_hms = ?,
       remaining = ?, remark = ?, total_used_hms = ?, status = 'ENDED',
@@ -598,6 +600,8 @@ function setSetting(key, value) {
 }
 
 module.exports = {
+  getHistoryByDate,
+  getHistoryByDateRange,
   initDB, getDB, closeDB,
   startBreak, endBreak, getActiveBreak, getTodayHistory,
   getPendingSyncs, markSyncDone, markSyncFailed, queueSync,

@@ -146,3 +146,18 @@ start().catch(err => {
   console.error('[BreakBot] Fatal startup error:', err);
   process.exit(1);
 });
+
+// ============================================================
+//  BREAK HISTORY API — for Tab5 date range filter
+// ============================================================
+app.get('/api/breaks/history', async (req, res) => {
+  try {
+    var dateStr = req.query.date || req.query.from;
+    if (!dateStr) return res.json({ error: 'Missing ?date=YYYY-MM-DD' });
+    var data = await require('./break-bot').getDashboardDataForDate(dateStr);
+    res.json({ ok: true, data: data });
+  } catch (err) {
+    console.error('[BreakBot] History error:', err.message);
+    res.json({ ok: false, error: err.message });
+  }
+});

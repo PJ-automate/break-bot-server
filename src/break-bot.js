@@ -1084,11 +1084,8 @@ async function sendStaffMonitoringReport(chatId) {
   try {
     var now = new Date();
     var todayStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
-    var phHour = parseInt(now.toLocaleString('en-US', { timeZone: 'Asia/Manila', hour12: false }).split(/[,\s]+/)[3].split(':')[0], 10);
-    var period = (phHour >= 12) ? 'DayShift' : 'NightShift';
-    var bd = getBusinessDate(now, period);
 
-    // Query all today's breaks for staff
+    // Query all today's breaks
     var allBreaks = db.getTodayHistory('__ALL__');
     if (!allBreaks || allBreaks.length === 0) {
       return sendMsg(chatId, '📭 *No break records found for today.*');
@@ -1100,68 +1097,112 @@ async function sendStaffMonitoringReport(chatId) {
       return sendMsg(chatId, '📭 *No staff break records found for today.*');
     }
 
-    // Group by user_id
-    var staffMap = {};
+    // Group by shift_period, then by user_id
+    var dayMap = {};
+    var nightMap = {};
     for (var i = 0; i < staffBreaks.length; i++) {
       var b = staffBreaks[i];
       var uid = String(b.user_id);
-      if (!staffMap[uid]) {
-        staffMap[uid] = { name: b.user_name, breaks: [], totalSecs: 0 };
+      var shiftPeriod = b.shift_period || 'DayShift';
+      var targetMap = (shiftPeriod === 'NightShift') ? nightMap : dayMap;
+
+      if (!targetMap[uid]) {
+        targetMap[uid] = { name: b.user_name, breaks: [], totalSecs: 0 };
       }
-      staffMap[uid].breaks.push(b);
+      targetMap[uid].breaks.push(b);
       if (b.status === 'ENDED' && b.duration_secs > 0) {
-        staffMap[uid].totalSecs += b.duration_secs;
+        targetMap[uid].totalSecs += b.duration_secs;
+      }
+    }
+
+    // For staff with no breaks today, determine their shift from history
+    var allStaffIds = Array.from(STAFF_IDS);
+    var staffShiftCache = {};
+    for (var s = 0; s < allStaffIds.length; s++) {
+      var sid = allStaffIds[s];
+      if (!dayMap[sid] && !nightMap[sid]) {
+        // Check DB for last known shift
+        try {
+          var lastRow = db.getDB().prepare('SELECT shift_period, user_name FROM breaks WHERE user_id = ? ORDER BY id DESC LIMIT 1').get(sid);
+          if (lastRow) {
+            staffShiftCache[sid] = { name: lastRow.user_name, shift: lastRow.shift_period || 'DayShift' };
+          } else {
+            staffShiftCache[sid] = { name: sid, shift: 'DayShift' }; // default
+          }
+        } catch(e) {
+          staffShiftCache[sid] = { name: sid, shift: 'DayShift' };
+        }
       }
     }
 
     // Build report message
     var lines = [];
     lines.push('📋 *Staff Break Monitoring*');
-    lines.push('📅 ' + todayStr + ' (' + period + ')');
+    lines.push('📅 ' + todayStr);
     lines.push('');
 
-    var allStaffIds = Array.from(STAFF_IDS);
+    function fmtHMS(secs) {
+      return String(Math.floor(secs / 3600)).padStart(2, '0') + ':' +
+        String(Math.floor((secs % 3600) / 60)).padStart(2, '0') + ':' +
+        String(secs % 60).padStart(2, '0');
+    }
+    function fmtRemaining(secs) {
+      var abs = Math.abs(secs);
+      var s = fmtHMS(abs);
+      return (secs >= 0 ? '' : '-') + s;
+    }
+
+    function addStaffSection(targetMap, shiftLabel) {
+      var staffInShift = Object.keys(targetMap);
+      if (staffInShift.length === 0) return false;
+
+      lines.push('🌞(' + shiftLabel + ')');
+
+      for (var s = 0; s < allStaffIds.length; s++) {
+        var sid = allStaffIds[s];
+        var entry = targetMap[sid];
+        if (!entry) continue;
+
+        lines.push('━━━━━━━━━━━━━━━━━━━');
+        lines.push('👤 ' + entry.name + ' (' + sid + ')');
+
+        for (var j = 0; j < entry.breaks.length; j++) {
+          var bk = entry.breaks[j];
+          var statusIcon = (bk.status === 'ON BREAK') ? '🔴' : '🟢';
+          var dur = bk.duration_hms || 'in progress';
+          var endT = bk.end_time || '...';
+          var remark = bk.remark ? ' ⚠️' + bk.remark : '';
+          lines.push('  ' + statusIcon + ' ' + bk.break_type + '   ' + bk.start_time + '→' + endT + ' (' + dur + ')' + remark);
+        }
+
+        var allowance = 7200;
+        var remaining = allowance - entry.totalSecs;
+        var remStr = fmtRemaining(remaining);
+        var totStr = fmtHMS(entry.totalSecs);
+        lines.push('  ⏱ Total: ' + totStr + ' │ ⏳ Remaining: ' + remStr);
+      }
+
+      return true;
+    }
+
+    // For staff with no breaks in either shift, add them to their cached shift
     for (var s = 0; s < allStaffIds.length; s++) {
       var sid = allStaffIds[s];
-      var entry = staffMap[sid];
-      lines.push('━━━━━━━━━━━━━━━━━━━');
-
-      if (!entry) {
-        // Staff has no breaks today — get name from DB or use ID
-        var fallbackName = sid;
-        for (var k = 0; k < allBreaks.length; k++) {
-          if (String(allBreaks[k].user_id) === sid) {
-            fallbackName = allBreaks[k].user_name;
-            break;
-          }
+      if (!dayMap[sid] && !nightMap[sid] && staffShiftCache[sid]) {
+        var info = staffShiftCache[sid];
+        if (info.shift === 'NightShift') {
+          if (!nightMap[sid]) nightMap[sid] = { name: info.name, breaks: [] };
+        } else {
+          if (!dayMap[sid]) dayMap[sid] = { name: info.name, breaks: [] };
         }
-        lines.push('👤 ' + fallbackName + ' (' + sid + ')');
-        lines.push('  📭 No breaks today');
-        continue;
       }
-
-      lines.push('👤 ' + entry.name + ' (' + sid + ')');
-
-      for (var j = 0; j < entry.breaks.length; j++) {
-        var bk = entry.breaks[j];
-        var statusIcon = (bk.status === 'ON BREAK') ? '🔴' : '🟢';
-        var dur = bk.duration_hms || 'in progress';
-        var endT = bk.end_time || '...';
-        var remark = bk.remark ? ' ⚠️' + bk.remark : '';
-        lines.push('  ' + statusIcon + ' ' + bk.break_type + '   ' + bk.start_time + '→' + endT + ' (' + dur + ')' + remark);
-      }
-
-      var allowance = 7200;
-      var remaining = allowance - entry.totalSecs;
-      var remStr = (remaining >= 0 ? '' : '-') +
-        String(Math.floor(Math.abs(remaining) / 3600)).padStart(2, '0') + ':' +
-        String(Math.floor((Math.abs(remaining) % 3600) / 60)).padStart(2, '0') + ':' +
-        String(Math.abs(remaining) % 60).padStart(2, '0');
-      var totStr = String(Math.floor(entry.totalSecs / 3600)).padStart(2, '0') + ':' +
-        String(Math.floor((entry.totalSecs % 3600) / 60)).padStart(2, '0') + ':' +
-        String(entry.totalSecs % 60).padStart(2, '0');
-      lines.push('  ⏱ Total: ' + totStr + ' │ ⏳ Remaining: ' + remStr);
     }
+
+    // Print DayShift section
+    var hasDay = addStaffSection(dayMap, 'DayShift');
+
+    // Print NightShift section
+    var hasNight = addStaffSection(nightMap, 'Night shift');
 
     lines.push('━━━━━━━━━━━━━━━━━━━');
     lines.push('⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯');
@@ -1191,6 +1232,8 @@ async function sendStaffMonitoringReport(chatId) {
     await sendMsg(chatId, '❌ Error loading staff break records.');
   }
 }
+
+async function trackOverbreak(userName, userId, shiftType, shiftPeriod, breakType, startTime, endTime, duration, businessDate) {}
 
 async function trackOverbreak(userName, userId, shiftType, shiftPeriod, breakType, startTime, endTime, duration, businessDate) {
   try {

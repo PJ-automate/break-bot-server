@@ -674,15 +674,16 @@ async function handleMessage(msg) {
       return sendUserHistory(chatId, userId, userName);
     case '/myid':
       return sendMsg(chatId, `🆔 Your Telegram ID: \`${userId}\``);
-    case '/monitoring':
-      // DM only, admin only — silently ignore in groups
-      if (msg.chat.type !== 'private') return;
-      if (!ADMIN_IDS.has(userId)) return sendMsg(chatId, 'Unknown command. Use /start, /end, /history, /myid');
-      // Extract optional date: /monitoring YYYY-MM-DD
-      var parts = text.split(' ').filter(Boolean);
-      var targetDate = (parts.length >= 2) ? parts[1] : '';
-      return sendStaffMonitoringReport(chatId, targetDate);
     default:
+      if (text.startsWith('/monitoring')) {
+        // DM only, admin only — silently ignore in groups
+        if (msg.chat.type !== 'private') return;
+        if (!ADMIN_IDS.has(userId)) return sendMsg(chatId, 'Unknown command. Use /start, /end, /history, /myid');
+        // Extract optional date: /monitoring YYYY-MM-DD
+        var parts = text.split(' ').filter(Boolean);
+        var targetDate = (parts.length >= 2) ? parts[1] : '';
+        return sendStaffMonitoringReport(chatId, targetDate);
+      }
       if (text.startsWith('/manual_start')) {
         return sendManualStartMenu(chatId, userName, userId);
       }

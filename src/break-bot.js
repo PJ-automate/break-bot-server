@@ -1191,9 +1191,9 @@ async function sendStaffMonitoringReport(chatId) {
       if (!dayMap[sid] && !nightMap[sid] && staffShiftCache[sid]) {
         var info = staffShiftCache[sid];
         if (info.shift === 'NightShift') {
-          if (!nightMap[sid]) nightMap[sid] = { name: info.name, breaks: [] };
+          if (!nightMap[sid]) nightMap[sid] = { name: info.name, breaks: [], totalSecs: 0 };
         } else {
-          if (!dayMap[sid]) dayMap[sid] = { name: info.name, breaks: [] };
+          if (!dayMap[sid]) dayMap[sid] = { name: info.name, breaks: [], totalSecs: 0 };
         }
       }
     }

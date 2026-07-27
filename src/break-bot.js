@@ -19,6 +19,15 @@ const SILENT_USERS = new Set([
 ]);
 function isSilentUser(userId) { return SILENT_USERS.has(String(userId)); }
 
+// Admin users: can use /monitoring to see staff break records
+const ADMIN_IDS = new Set([
+  '5300659841', '6128817526', '7461355274', '6113598688'
+]);
+// Staff users: their breaks are visible to admins via /monitoring
+const STAFF_IDS = new Set([
+  '8358097075', '8208949028', '6150412553', '5917670597',
+  '5865488885', '7177886092'
+]);
 
 // In-memory shift cache (5 min TTL)
 const shiftCache = new Map();
@@ -665,6 +674,11 @@ async function handleMessage(msg) {
       return sendUserHistory(chatId, userId, userName);
     case '/myid':
       return sendMsg(chatId, `🆔 Your Telegram ID: \`${userId}\``);
+    case '/monitoring':
+      // DM only, admin only — silently ignore in groups
+      if (msg.chat.type !== 'private') return;
+      if (!ADMIN_IDS.has(userId)) return sendMsg(chatId, 'Unknown command. Use /start, /end, /history, /myid');
+      return sendStaffMonitoringReport(chatId);
     default:
       if (text.startsWith('/manual_start')) {
         return sendManualStartMenu(chatId, userName, userId);
@@ -1064,6 +1078,119 @@ async function sendUserHistory(chatId, userId, userName) {
 // ============================================================
 //  OVERBREAK TRACKER
 // ============================================================
+
+// Monitor staff break records — admin only, DM only
+async function sendStaffMonitoringReport(chatId) {
+  try {
+    var now = new Date();
+    var todayStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+    var phHour = parseInt(now.toLocaleString('en-US', { timeZone: 'Asia/Manila', hour12: false }).split(/[,\s]+/)[3].split(':')[0], 10);
+    var period = (phHour >= 12) ? 'DayShift' : 'NightShift';
+    var bd = getBusinessDate(now, period);
+
+    // Query all today's breaks for staff
+    var allBreaks = db.getTodayHistory('__ALL__');
+    if (!allBreaks || allBreaks.length === 0) {
+      return sendMsg(chatId, '📭 *No break records found for today.*');
+    }
+
+    // Filter to staff only
+    var staffBreaks = allBreaks.filter(function(b) { return STAFF_IDS.has(String(b.user_id)); });
+    if (!staffBreaks || staffBreaks.length === 0) {
+      return sendMsg(chatId, '📭 *No staff break records found for today.*');
+    }
+
+    // Group by user_id
+    var staffMap = {};
+    for (var i = 0; i < staffBreaks.length; i++) {
+      var b = staffBreaks[i];
+      var uid = String(b.user_id);
+      if (!staffMap[uid]) {
+        staffMap[uid] = { name: b.user_name, breaks: [], totalSecs: 0 };
+      }
+      staffMap[uid].breaks.push(b);
+      if (b.status === 'ENDED' && b.duration_secs > 0) {
+        staffMap[uid].totalSecs += b.duration_secs;
+      }
+    }
+
+    // Build report message
+    var lines = [];
+    lines.push('📋 *Staff Break Monitoring*');
+    lines.push('📅 ' + todayStr + ' (' + period + ')');
+    lines.push('');
+
+    var allStaffIds = Array.from(STAFF_IDS);
+    for (var s = 0; s < allStaffIds.length; s++) {
+      var sid = allStaffIds[s];
+      var entry = staffMap[sid];
+      lines.push('━━━━━━━━━━━━━━━━━━━');
+
+      if (!entry) {
+        // Staff has no breaks today — get name from DB or use ID
+        var fallbackName = sid;
+        for (var k = 0; k < allBreaks.length; k++) {
+          if (String(allBreaks[k].user_id) === sid) {
+            fallbackName = allBreaks[k].user_name;
+            break;
+          }
+        }
+        lines.push('👤 ' + fallbackName + ' (' + sid + ')');
+        lines.push('  📭 No breaks today');
+        continue;
+      }
+
+      lines.push('👤 ' + entry.name + ' (' + sid + ')');
+
+      for (var j = 0; j < entry.breaks.length; j++) {
+        var bk = entry.breaks[j];
+        var statusIcon = (bk.status === 'ON BREAK') ? '🔴' : '🟢';
+        var dur = bk.duration_hms || 'in progress';
+        var endT = bk.end_time || '...';
+        var remark = bk.remark ? ' ⚠️' + bk.remark : '';
+        lines.push('  ' + statusIcon + ' ' + bk.break_type + '   ' + bk.start_time + '→' + endT + ' (' + dur + ')' + remark);
+      }
+
+      var allowance = 7200;
+      var remaining = allowance - entry.totalSecs;
+      var remStr = (remaining >= 0 ? '' : '-') +
+        String(Math.floor(Math.abs(remaining) / 3600)).padStart(2, '0') + ':' +
+        String(Math.floor((Math.abs(remaining) % 3600) / 60)).padStart(2, '0') + ':' +
+        String(Math.abs(remaining) % 60).padStart(2, '0');
+      var totStr = String(Math.floor(entry.totalSecs / 3600)).padStart(2, '0') + ':' +
+        String(Math.floor((entry.totalSecs % 3600) / 60)).padStart(2, '0') + ':' +
+        String(entry.totalSecs % 60).padStart(2, '0');
+      lines.push('  ⏱ Total: ' + totStr + ' │ ⏳ Remaining: ' + remStr);
+    }
+
+    lines.push('━━━━━━━━━━━━━━━━━━━');
+    lines.push('⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯');
+    lines.push('_End of report_');
+
+    // Send in chunks if too long (Telegram 4096 limit)
+    var fullText = lines.join('\n');
+    if (fullText.length > 4000) {
+      var chunks = [];
+      var currentChunk = [];
+      for (var li = 0; li < lines.length; li++) {
+        currentChunk.push(lines[li]);
+        if (currentChunk.join('\n').length > 3500) {
+          chunks.push(currentChunk.join('\n'));
+          currentChunk = [];
+        }
+      }
+      if (currentChunk.length > 0) chunks.push(currentChunk.join('\n'));
+      for (var ci = 0; ci < chunks.length; ci++) {
+        await sendMsg(chatId, chunks[ci]);
+      }
+    } else {
+      await sendMsg(chatId, fullText);
+    }
+  } catch (err) {
+    console.error('[BreakBot] Monitoring error:', err.message);
+    await sendMsg(chatId, '❌ Error loading staff break records.');
+  }
+}
 
 async function trackOverbreak(userName, userId, shiftType, shiftPeriod, breakType, startTime, endTime, duration, businessDate) {
   try {

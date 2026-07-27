@@ -1157,11 +1157,15 @@ async function sendStaffMonitoringReport(chatId, targetDate) {
       return (secs >= 0 ? '' : '-') + s;
     }
 
-    function addStaffSection(targetMap, shiftLabel) {
+    function addStaffSection(emoji, targetMap, shiftLabel, isFirst) {
       var staffInShift = Object.keys(targetMap);
       if (staffInShift.length === 0) return false;
 
-      lines.push('🌞(' + shiftLabel + ')');
+      // Add spacing between sections
+      if (!isFirst) lines.push('');
+
+      lines.push(emoji + '(' + shiftLabel + ')');
+      lines.push('');
 
       for (var s = 0; s < allStaffIds.length; s++) {
         var sid = allStaffIds[s];
@@ -1204,10 +1208,10 @@ async function sendStaffMonitoringReport(chatId, targetDate) {
     }
 
     // Print DayShift section
-    var hasDay = addStaffSection(dayMap, 'DayShift');
+    var hasDay = addStaffSection('🌞', dayMap, 'DayShift', true);
 
     // Print NightShift section
-    var hasNight = addStaffSection(nightMap, 'Night shift');
+    var hasNight = addStaffSection('🌜', nightMap, 'Night shift', false);
 
     lines.push('━━━━━━━━━━━━━━━━━━━');
     lines.push('⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯');

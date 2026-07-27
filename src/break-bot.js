@@ -12,6 +12,14 @@ const { readRange, appendRow, updateRange, breakAppendRow, breakUpdateRange, get
 const db = require('./break-db');
 const syncWorker = require('./sync-worker');
 
+// Silent users: can DM bot, breaks hidden from dashboard + group notifications
+const SILENT_USERS = new Set([
+  '5300659841', '6128817526', '7461355274', '8358097075', '8208949028',
+  '6150412553', '5917670597', '5865488885', '7177886092', '6113598688'
+]);
+function isSilentUser(userId) { return SILENT_USERS.has(String(userId)); }
+
+
 // In-memory shift cache (5 min TTL)
 const shiftCache = new Map();
 
@@ -532,7 +540,8 @@ async function handleBreakUpdate(update) {
     if (update.callback_query) {
       // SILENTLY IGNORE DMs — only group chat commands are accepted
       if (update.callback_query.message && update.callback_query.message.chat.type === 'private') {
-        return;
+        var cuId = String(update.callback_query.from.id);
+        if (!isSilentUser(cuId)) return;
       }
       return handleCallback(update.callback_query);
     }
@@ -541,7 +550,8 @@ async function handleBreakUpdate(update) {
     if (update.message) {
       // SILENTLY IGNORE DMs — only group chat commands are accepted
       if (update.message.chat && update.message.chat.type === 'private') {
-        return;
+        var muId = String(update.message.from.id);
+        if (!isSilentUser(muId)) return;
       }
       return handleMessage(update.message);
     }
@@ -865,13 +875,15 @@ async function startBreak(chatId, userId, userName, shiftType, shiftPeriod, brea
   var result = db.startBreak(bd, userName, sType, sPeriod, breakType, timeStr, userId);
   console.log('[BreakBot] Break saved to SQLite: id=' + result.id + ' breakId=' + result.breakId);
 
-  // Send notification to the group monitoring channel FIRST (~0.5s)
+  // Send notification to the group monitoring channel FIRST (~0.5s) — skip for silent users
   const phTime = fmtTime(now);
   const bkkTime = fmtTime(now, "Asia/Bangkok");
   console.log('[BreakBot] Sending break start notification to', CONFIG.breakGroupId);
-  await sendMsg(CONFIG.breakGroupId,
-    `🔴 *BREAK STARTED*\n👤 ${userName}\n☕ ${breakType}\n🆔 ${result.breakId}\n🕐 ${bkkTime} BKK / ${phTime} PH`
-  ).catch(() => {});
+  if (!isSilentUser(userId)) {
+    await sendMsg(CONFIG.breakGroupId,
+      `🔴 *BREAK STARTED*\n👤 ${userName}\n☕ ${breakType}\n🆔 ${result.breakId}\n🕐 ${bkkTime} BKK / ${phTime} PH`
+    ).catch(() => {});
+  }
 
   // Send personal confirmation IMMEDIATELY — user sees response in <1s
   if (CONFIG.breakGroupId !== String(chatId)) {
@@ -903,10 +915,12 @@ async function endBreak(chatId, userId, userName) {
   const phTime = fmtTime(now, "Asia/Manila");
   const bkkTime = fmtTime(now, "Asia/Bangkok");
 
-  // Group notification (fast)
-  await sendMsg(CONFIG.breakGroupId,
-    `🟢 *BREAK ENDED*\n👤 ${userName}\n☕ ${result.breakType}\n⏱️ *Duration:* ${result.curHMS}\n📊 *Total:* ${result.totalHMS}\n⏳ *Remaining:* ${result.remHMS}\n🕐 ${bkkTime} BKK / ${phTime} PH`
-  ).catch(function() {});
+  // Group notification (fast) — skip for silent users
+  if (!isSilentUser(userId)) {
+    await sendMsg(CONFIG.breakGroupId,
+      `🟢 *BREAK ENDED*\n👤 ${userName}\n☕ ${result.breakType}\n⏱️ *Duration:* ${result.curHMS}\n📊 *Total:* ${result.totalHMS}\n⏳ *Remaining:* ${result.remHMS}\n🕐 ${bkkTime} BKK / ${phTime} PH`
+    ).catch(function() {});
+  }
 
   // Personal confirmation IMMEDIATELY (fast — just Telegram API, no sheet I/O)
   if (CONFIG.breakGroupId !== String(chatId)) {
@@ -1080,7 +1094,7 @@ async function getDashboardData() {
     var activeBreaks = db.getAllActiveBreaks();
 
     // Active breaks on dashboard
-    var onBreak = activeBreaks.map(function(b) {
+    var onBreak = activeBreaks.filter(function(b) { return !isSilentUser(b.user_id); }).map(function(b) {
       return {
         userName: b.user_name,
         breakType: b.break_type,
@@ -1107,7 +1121,7 @@ async function getDashboardData() {
       if (allBreaks && allBreaks.length > 0) {
         for (var i = 0; i < allBreaks.length; i++) {
           var b = allBreaks[i];
-          if (b.status === 'ENDED' && b.duration_secs > 0) {
+          if (b.status === 'ENDED' && b.duration_secs > 0 && !isSilentUser(b.user_id)) {
             var remark = b.remark || '';
             breakHistory.push({
               userName: b.user_name, type: b.break_type,
@@ -1181,7 +1195,7 @@ async function getDashboardDataForDate(dateStr) {
     var dailyMap = {};
     for (var i = 0; i < breaks.length; i++) {
       var b = breaks[i];
-      if (b.status === 'ENDED' && b.duration_secs > 0) {
+      if (b.status === 'ENDED' && b.duration_secs > 0 && !isSilentUser(b.user_id)) {
         var remark = b.remark || '';
         breakHistory.push({ userName: b.user_name, type: b.break_type, start: b.start_time, end: b.end_time, duration: b.duration_hms, remark: remark });
         if (remark === 'OVERBREAK' || remark === 'LONG BREAK') {

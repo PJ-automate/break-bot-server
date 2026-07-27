@@ -678,7 +678,10 @@ async function handleMessage(msg) {
       // DM only, admin only — silently ignore in groups
       if (msg.chat.type !== 'private') return;
       if (!ADMIN_IDS.has(userId)) return sendMsg(chatId, 'Unknown command. Use /start, /end, /history, /myid');
-      return sendStaffMonitoringReport(chatId);
+      // Extract optional date: /monitoring YYYY-MM-DD
+      var parts = text.split(' ').filter(Boolean);
+      var targetDate = (parts.length >= 2) ? parts[1] : '';
+      return sendStaffMonitoringReport(chatId, targetDate);
     default:
       if (text.startsWith('/manual_start')) {
         return sendManualStartMenu(chatId, userName, userId);
@@ -1080,13 +1083,14 @@ async function sendUserHistory(chatId, userId, userName) {
 // ============================================================
 
 // Monitor staff break records — admin only, DM only
-async function sendStaffMonitoringReport(chatId) {
+async function sendStaffMonitoringReport(chatId, targetDate) {
   try {
     var now = new Date();
-    var todayStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+    // Use provided date or default to today
+    var todayStr = targetDate || new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
 
-    // Query all today's breaks
-    var allBreaks = db.getTodayHistory('__ALL__');
+    // Query breaks for target date
+    var allBreaks = db.getHistoryByDate(todayStr, '__ALL__');
     if (!allBreaks || allBreaks.length === 0) {
       return sendMsg(chatId, '📭 *No break records found for today.*');
     }

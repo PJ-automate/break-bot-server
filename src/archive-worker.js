@@ -70,6 +70,15 @@ async function ensureArchiveGrid(ssId, neededRows) {
 /**
  * Get current PH time as a formatted log prefix: "YYYY-MM-DD HH:MM:SS PH"
  */
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise(function(_, reject) {
+      setTimeout(function() { reject(new Error('Archive read timed out (' + ms + 'ms)')); }, ms);
+    })
+  ]);
+}
+
 function _logTimestamp() {
   const now = new Date();
   const dateStr = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
@@ -223,8 +232,8 @@ async function runArchive() {
 
     console.log(ts + ' [ArchiveWorker] Checking CS BREAK for old data...');
 
-    // Read all data from CS BREAK sheet
-    const data = await readRange(ssId, 'CS BREAK!A:O');
+    // Read all data from CS BREAK sheet (with 3 min timeout for full sheet)
+    const data = await withTimeout(readRange(ssId, 'CS BREAK!A:O'), 180000);
     if (!data || data.length < 2) {
       console.log(ts + ' [ArchiveWorker] No data rows in CS BREAK (0 rows to archive)');
       // Mark as archived so we don't keep checking on every interval
@@ -676,7 +685,7 @@ async function reconcileActiveBreaks() {
   // Read current CS BREAK sheet data (only need columns M, G, H, I, J, L, N)
   var data;
   try {
-    data = await readRange(CONFIG.breakSheetId, 'CS BREAK!A:O');
+    data = await withTimeout(readRange(CONFIG.breakSheetId, 'CS BREAK!A:O'), 180000);
   } catch (e) {
     console.warn(ts + ' [ArchiveWorker] Reconcile read error: ' + e.message);
     return;

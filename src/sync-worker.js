@@ -8,6 +8,7 @@
 'use strict';
 
 const db = require('./break-db');
+const coordinator = require('./coordinator');
 const CONFIG = require('./config');
 const { breakAppendRow, breakUpdateRange, updateRange, readRange, getOrCreateSheet, formatDate, getBreakSheetId, reapplyBreakNumberFormats } = require('./google');
 
@@ -37,6 +38,13 @@ function withTimeout(promise, ms, label) {
  */
 async function processSyncQueue() {
   if (processing) return;
+
+  // Pause GS writes while archive is running (prevents row mapping corruption)
+  if (coordinator.isArchiveRunning()) {
+    console.log('[SyncWorker] Archive lock held — deferring sync');
+    return;
+  }
+
   processing = true;
 
   try {

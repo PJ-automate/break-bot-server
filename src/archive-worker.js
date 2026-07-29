@@ -23,6 +23,7 @@
 'use strict';
 
 const CONFIG = require('./config');
+const coordinator = require('./coordinator');
 const { readRange, getOrCreateSheet, updateRange, breakAppendRow, breakUpdateRange, breakBatchUpdate, formatBreakSheets } = require('./google');
 const { google } = require("googleapis");
 const key = require(CONFIG.breakServiceAccountPath);
@@ -191,6 +192,8 @@ async function runArchive() {
     return;
   }
   running = true;
+  coordinator.setArchiveRunning(true);
+  console.log(ts + ' [ArchiveWorker] Acquired archive lock — sync writes paused');
 
   // ssId declared HERE (outside try) so cleanup calls below can access it
   const ssId = CONFIG.breakSheetId;
@@ -448,6 +451,8 @@ async function runArchive() {
     console.error('[ArchiveWorker] Archives cleanup error:', e.message);
   }
 
+  coordinator.setArchiveRunning(false);
+  console.log(_logTimestamp() + ' [ArchiveWorker] Released archive lock — sync writes resumed');
   running = false;
 }
 

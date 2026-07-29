@@ -912,6 +912,16 @@ async function startBreak(chatId, userId, userName, shiftType, shiftPeriod, brea
 
   // Trigger sync worker (non-blocking — pushes to Google Sheets asynchronously)
   syncWorker.processSyncQueue().catch(function() {});
+
+  // Immediate inline sync for near-instant sheet update
+  try {
+    var freshBreak = db.getDB().prepare('SELECT * FROM breaks WHERE id = ?').get(result.id);
+    if (freshBreak) {
+      syncWorker.syncBreakNow(freshBreak, 'start').catch(function(er) {
+        console.warn('[BreakBot] Inline start sync issue:', er.message.substring(0, 60));
+      });
+    }
+  } catch(e) {}
 }
 
 // ============================================================
@@ -949,6 +959,16 @@ async function endBreak(chatId, userId, userName) {
 
   // Trigger sync worker (non-blocking — pushes to Google Sheets asynchronously)
   syncWorker.processSyncQueue().catch(function() {});
+
+  // Immediate inline sync for near-instant sheet update
+  try {
+    var endedBreak = db.getDB().prepare('SELECT * FROM breaks WHERE id = ?').get(result.row.id);
+    if (endedBreak) {
+      syncWorker.syncBreakNow(endedBreak, 'end').catch(function(er) {
+        console.warn('[BreakBot] Inline end sync issue:', er.message.substring(0, 60));
+      });
+    }
+  } catch(e) {}
 }
 
 // ============================================================

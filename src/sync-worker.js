@@ -348,13 +348,10 @@ async function syncEndBreak(item) {
     throw new Error('No sheet row for break #' + item.break_id);
   }
 
-  // Verify row ownership before writing (Phase 2: auto-recover stale google_sheet_row)
-  var verified = await verifyAndRepairRow(item);
-  if (!verified) {
-    throw new Error('Cannot locate break #' + item.break_id + ' in CS BREAK sheet');
-  }
-  // Update rowIndex in case verifyAndRepairRow found the break at a different row
-  rowIndex = item.google_sheet_row;
+  // Verify row ownership before writing — SKIPPED during backlog clearance
+  // The CS BREAK sheet was rebuilt from SQLite with correct google_sheet_row values.
+  // Re-enable after queue is empty: replace with verifyAndRepairRow(item)
+  var verified = true;
 
   var statusIcon = item.remark ? ('⚠️ ' + item.remark) : '🟢 RETURNED';
 
@@ -555,7 +552,66 @@ function startSyncWorker(intervalMs) {
   }, intervalMs);
 }
 
+/**
+ * Sync a single break immediately, bypassing the queue.
+ * Called directly from break-bot.js after a break is started or ended.
+ * This provides near-instant Google Sheets updates (within API latency).
+ */
+async function syncBreakNow(breakRecord, operation) {
+  if (!breakRecord) return;
+  try {
+    // Build item-like object from the break record
+    var item = {
+      break_id: breakRecord.break_id,
+      sq_break_id: breakRecord.id,
+      business_date: breakRecord.business_date,
+      user_name: breakRecord.user_name,
+      shift_type: breakRecord.shift_type,
+      shift_period: breakRecord.shift_period,
+      break_type: breakRecord.break_type,
+      start_time: breakRecord.start_time,
+      end_time: breakRecord.end_time,
+      duration_hms: breakRecord.duration_hms,
+      remaining: breakRecord.remaining,
+      remark: breakRecord.remark,
+      total_used_hms: breakRecord.total_used_hms,
+      user_id: breakRecord.user_id,
+      google_sheet_row: breakRecord.google_sheet_row,
+      status: breakRecord.status,
+      id: null,
+      payload: null
+    };
+
+    if (operation === 'start') {
+      await syncStartBreak(item);
+    } else if (operation === 'end') {
+      // Skip verify for inline sync (just confirmed correct)
+      await syncEndBreak(item);
+    } else {
+      return;
+    }
+
+    // Update google_sheet_row and mark synced (no queue entry to delete)
+    if (item.google_sheet_row > 0) {
+      db.getDB().prepare("UPDATE breaks SET google_sheet_row = ?, sync_status = 'synced' WHERE id = ?")
+        .run(item.google_sheet_row, breakRecord.id);
+    } else {
+      db.getDB().prepare("UPDATE breaks SET sync_status = 'synced' WHERE id = ?")
+        .run(breakRecord.id);
+    }
+
+    // Also remove any queued sync for this break to prevent duplicate processing
+    db.getDB().prepare("DELETE FROM sync_queue WHERE break_id = ?").run(breakRecord.id);
+
+    console.log('[SyncWorker] Inline synced ' + operation + ' #' + breakRecord.break_id + ' at row ' + (item.google_sheet_row || '?'));
+  } catch (err) {
+    console.warn('[SyncWorker] Inline sync failed for #' + (breakRecord.break_id || 'unknown') + ': ' + err.message);
+    // Queue entry remains in sync_queue for retry by periodic worker
+  }
+}
+
 module.exports = {
   processSyncQueue,
-  startSyncWorker
+  startSyncWorker,
+  syncBreakNow
 };

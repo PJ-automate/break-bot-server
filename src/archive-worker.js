@@ -193,6 +193,7 @@ async function runArchive() {
   }
   running = true;
   coordinator.setArchiveRunning(true);
+  coordinator.recordArchiveStart();
   console.log(ts + ' [ArchiveWorker] Acquired archive lock — sync writes paused');
 
   // ssId declared HERE (outside try) so cleanup calls below can access it
@@ -451,6 +452,9 @@ async function runArchive() {
     console.error('[ArchiveWorker] Archives cleanup error:', e.message);
   }
 
+  var archiveDuration = coordinator.recordArchiveFinish() || 0;
+  var m = coordinator.getMetrics();
+  console.log(_logTimestamp() + ' [ArchiveWorker] Archive complete: duration=' + archiveDuration + 's, deferredSyncs=' + m.deferredSyncs + ', recoveries=' + m.rowRecoveries);
   coordinator.setArchiveRunning(false);
   console.log(_logTimestamp() + ' [ArchiveWorker] Released archive lock — sync writes resumed');
   running = false;

@@ -15,6 +15,14 @@
 
 let _archiveRunning = false;
 
+// Metrics for monitoring archive and recovery activity
+var _metrics = {
+  archiveStartTime: null,
+  archiveFinishTime: null,
+  deferredSyncs: 0,
+  rowRecoveries: 0
+};
+
 /**
  * Set whether the archive worker is currently running.
  * Called by the archive worker at the start and end of runArchive().
@@ -31,7 +39,49 @@ function isArchiveRunning() {
   return _archiveRunning;
 }
 
+/** Record archive start timestamp. */
+function recordArchiveStart() {
+  _metrics.archiveStartTime = Date.now();
+  _metrics.archiveFinishTime = null;
+}
+
+/** Record archive finish and return duration in seconds. */
+function recordArchiveFinish() {
+  _metrics.archiveFinishTime = Date.now();
+  if (_metrics.archiveStartTime) {
+    return Math.round((_metrics.archiveFinishTime - _metrics.archiveStartTime) / 1000);
+  }
+  return 0;
+}
+
+/** Increment the deferred sync counter. */
+function incrementDeferredSyncs() {
+  _metrics.deferredSyncs++;
+}
+
+/** Increment the row recovery counter. */
+function incrementRowRecoveries() {
+  _metrics.rowRecoveries++;
+}
+
+/** Get all metrics. */
+function getMetrics() {
+  return {
+    archiveRunning: _archiveRunning,
+    archiveDuration: _metrics.archiveStartTime && _metrics.archiveFinishTime
+      ? Math.round((_metrics.archiveFinishTime - _metrics.archiveStartTime) / 1000) + 's'
+      : (_metrics.archiveStartTime ? 'in progress' : 'not run'),
+    deferredSyncs: _metrics.deferredSyncs,
+    rowRecoveries: _metrics.rowRecoveries
+  };
+}
+
 module.exports = {
   setArchiveRunning,
-  isArchiveRunning
+  isArchiveRunning,
+  recordArchiveStart,
+  recordArchiveFinish,
+  incrementDeferredSyncs,
+  incrementRowRecoveries,
+  getMetrics
 };

@@ -910,10 +910,8 @@ async function startBreak(chatId, userId, userName, shiftType, shiftPeriod, brea
     ).catch(() => {});
   }
 
-  // Trigger sync worker (non-blocking — pushes to Google Sheets asynchronously)
-  syncWorker.processSyncQueue().catch(function() {});
-
-  // Immediate inline sync for near-instant sheet update
+  // Inline sync — pushes to Google Sheets immediately
+  // Also handles queue cleanup — no need for separate processSyncQueue here
   try {
     var freshBreak = db.getDB().prepare('SELECT * FROM breaks WHERE id = ?').get(result.id);
     if (freshBreak) {
@@ -957,10 +955,8 @@ async function endBreak(chatId, userId, userName) {
     ).catch(function() {});
   }
 
-  // Trigger sync worker (non-blocking — pushes to Google Sheets asynchronously)
-  syncWorker.processSyncQueue().catch(function() {});
-
-  // Immediate inline sync for near-instant sheet update
+  // Inline sync — pushes to Google Sheets immediately
+  // Also handles queue cleanup — no need for separate processSyncQueue here
   try {
     var endedBreak = db.getDB().prepare('SELECT * FROM breaks WHERE id = ?').get(result.row.id);
     if (endedBreak) {

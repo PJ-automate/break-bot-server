@@ -217,6 +217,103 @@ async function syncStartBreak(item) {
 }
 
 /**
+ * Verify that google_sheet_row still points to the correct break,
+ * and repair it if necessary.
+ *
+ * Reads the target row from Google Sheets and checks:
+ *  - Row exists
+ *  - Break ID (column N) matches item.break_id
+ *  - Agent name (column B) matches item.user_name
+ *  - Start time (column F) matches item.start_time
+ *
+ * If verification fails, searches column N for the correct break_id.
+ * If found, updates google_sheet_row in SQLite and item.google_sheet_row.
+ *
+ * @returns {boolean} true if row is valid or was repaired; false if not found
+ */
+async function verifyAndRepairRow(item) {
+  if (!item.google_sheet_row || item.google_sheet_row <= 0) {
+    return false; // No row to verify — will be handled by caller
+  }
+
+  // Read the target row from GS (columns A-O, just 1 row)
+  var rowData;
+  try {
+    rowData = await withTimeout(readRange(SH, 'CS BREAK!A' + item.google_sheet_row + ':O' + item.google_sheet_row), 30000, 'verifyRow');
+  } catch(e) {
+    // Row read failed — row may not exist (deleted by archive)
+    rowData = null;
+  }
+
+  // Check if the row belongs to this break
+  var isCorrect = false;
+  if (rowData && rowData[0]) {
+    var r = rowData[0];
+    var sheetBreakId = String(r[13] || '').trim();
+    var sheetAgent = String(r[1] || '').trim();
+    var sheetStart = String(r[5] || '').trim();
+
+    // Break ID must match exactly
+    if (sheetBreakId === item.break_id) {
+      // Agent and start time should match (lenient — time formats may vary)
+      var agentOk = !item.user_name || sheetAgent.indexOf(item.user_name) >= 0 || item.user_name.indexOf(sheetAgent) >= 0;
+      var startOk = !item.start_time || sheetStart === item.start_time || sheetStart.substring(0, 5) === item.start_time.substring(0, 5);
+      if (agentOk && startOk) {
+        isCorrect = true;
+      } else {
+        // Break ID matches but agent/start differ — could be a rare collision
+        console.warn('[SyncWorker] Break ID match but context mismatch at row ' + item.google_sheet_row +
+          ' for #' + item.break_id + ' (agent: ' + sheetAgent + ' vs ' + item.user_name + ')');
+      }
+    }
+  }
+
+  if (isCorrect) {
+    return true; // Row is valid — proceed normally
+  }
+
+  // === VERIFICATION FAILED — SEARCH FOR CORRECT ROW ===
+  console.log('[SyncWorker] Row ' + item.google_sheet_row + ' mismatch for #' + item.break_id + ' — scanning sheet...');
+
+  // Read column N (break_id) from all rows in CS BREAK
+  var allIds;
+  try {
+    allIds = await withTimeout(readRange(SH, 'CS BREAK!A:N'), 60000, 'searchBreakRow');
+  } catch(e) {
+    console.warn('[SyncWorker] Search scan failed for #' + item.break_id + ': ' + e.message);
+    return false;
+  }
+
+  if (!allIds || allIds.length < 2) {
+    console.warn('[SyncWorker] No data in CS BREAK to search for #' + item.break_id);
+    return false;
+  }
+
+  // Search for break_id in column N (index 13)
+  for (var i = 1; i < allIds.length; i++) {
+    if (!allIds[i] || !allIds[i][13]) continue;
+    if (String(allIds[i][13]).trim() === item.break_id) {
+      var foundRow = i + 1; // 1-indexed sheet row
+      console.log('[SyncWorker] ✓ Repaired: break #' + item.break_id + ' found at row ' + foundRow + ' (was ' + item.google_sheet_row + ')');
+
+      // Update google_sheet_row in SQLite
+      try {
+        db.getDB().prepare('UPDATE breaks SET google_sheet_row = ? WHERE id = ?').run(foundRow, item.sq_break_id);
+      } catch(dbErr) {
+        console.warn('[SyncWorker] DB update failed during repair: ' + dbErr.message);
+      }
+
+      item.google_sheet_row = foundRow;
+      return true;
+    }
+  }
+
+  // Break ID not found anywhere in CS BREAK
+  console.warn('[SyncWorker] Break #' + item.break_id + ' not found in CS BREAK sheet — may have been archived or deleted');
+  return false;
+}
+
+/**
  * Sync an end break operation to Google Sheets.
  * Updates the existing row with end time, duration, etc.
  */
@@ -226,6 +323,14 @@ async function syncEndBreak(item) {
   if (!rowIndex || rowIndex <= 0) {
     throw new Error('No sheet row for break #' + item.break_id);
   }
+
+  // Verify row ownership before writing (Phase 2: auto-recover stale google_sheet_row)
+  var verified = await verifyAndRepairRow(item);
+  if (!verified) {
+    throw new Error('Cannot locate break #' + item.break_id + ' in CS BREAK sheet');
+  }
+  // Update rowIndex in case verifyAndRepairRow found the break at a different row
+  rowIndex = item.google_sheet_row;
 
   var statusIcon = item.remark ? ('⚠️ ' + item.remark) : '🟢 RETURNED';
 

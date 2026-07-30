@@ -148,6 +148,12 @@ async function processSyncQueue() {
         }
 
         if (item.operation === 'start') {
+          // Re-check google_sheet_row — inline sync may have just set it
+          var freshRow = db.getDB().prepare("SELECT google_sheet_row FROM breaks WHERE id = ?").get(item.sq_break_id);
+          if (freshRow && freshRow.google_sheet_row > 0) {
+            console.log('[SyncWorker] Start #' + item.break_id + ' already at row ' + freshRow.google_sheet_row + ' — periodic skip');
+            continue;
+          }
           await syncStartBreak(item);
         } else if (item.operation === 'end') {
           await syncEndBreak(item);

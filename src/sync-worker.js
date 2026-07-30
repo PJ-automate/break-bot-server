@@ -460,10 +460,7 @@ async function syncBreakNow(breakRecord, operation) {
     // STEP 1: Register as in-flight — prevents periodic worker from processing
     inFlightSyncs.add(breakRecord.break_id);
 
-    // STEP 2: Delete queue entry — prevents periodic worker from finding it
-    db.getDB().prepare("DELETE FROM sync_queue WHERE break_id = ?").run(breakRecord.id);
-
-    // STEP 3: Idempotency check — if already synced, skip
+    // STEP 2: Idempotency check — if already synced, skip
     if (operation === 'start' && breakRecord.google_sheet_row > 0) {
       console.log('[SyncWorker] Start #' + breakRecord.break_id + ' already at row ' + breakRecord.google_sheet_row + ' — skipping duplicate');
       return;
@@ -511,6 +508,9 @@ async function syncBreakNow(breakRecord, operation) {
       db.getDB().prepare("UPDATE breaks SET sync_status = 'synced' WHERE id = ?")
         .run(breakRecord.id);
     }
+
+    // Delete queue entry ONLY after GS call succeeds — preserves retry on failure
+    db.getDB().prepare("DELETE FROM sync_queue WHERE break_id = ?").run(breakRecord.id);
 
     console.log('[SyncWorker] Inline synced ' + operation + ' #' + breakRecord.break_id + ' at row ' + (item.google_sheet_row || '?'));
   } catch (err) {

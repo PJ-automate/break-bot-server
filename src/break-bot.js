@@ -36,7 +36,7 @@ const shiftCache = new Map();
 var BREAK_SHEETS_READY = false;
 
 // Total-used cache — key: userId_businessDate_shift_period → seconds used.
-// Eliminates readRange('CS BREAK!A1:O1') in endBreak for prev totals.
+// Eliminates readRange('CS BREAK!A:O') in endBreak for prev totals.
 // Updated on each endBreak; read from DAILY SUMMARY on first call per day.
 var totalUsedCache = new Map();
 
@@ -375,7 +375,7 @@ async function getBreakSheet() {
   // Create CS BREAK sheet if missing
   var bs = await getOrCreateSheet(SH, 'CS BREAK');
   if (bs.created) {
-    await updateRange(SH, 'CS BREAK!A1:O1', [[
+    await updateRange(SH, 'CS BREAK!A:O', [[
       'Date','Name','Shift','Period','Break Type','Start Time',
       'End Time','Duration','Remaining','Remark','User ID','Total Used','Status','Break ID','Notes'
     ]]);
@@ -407,7 +407,7 @@ async function appendBreakRow(values) {
   if (raw[0]) raw[0] = dateToSerial(raw[0]);         // column A: date → serial
   if (raw[5]) raw[5] = timeToSerial(raw[5]);         // column F: start time → serial
   try {
-    const res = await breakAppendRow(SH, 'CS BREAK!A1:O1', raw);
+    const res = await breakAppendRow(SH, 'CS BREAK!A:O', raw);
     // Extract row number from response: "CS BREAK!A16:O16" → 16
     const range = res?.updates?.updatedRange || '';
     const match = range.match(/A(\d+):/);
@@ -425,7 +425,7 @@ async function readBreakData() {
   // (e.g. getActiveBreakRow + findTodayShift) read the same data in one interaction.
   var cached = getCachedData();
   if (cached) return cached;
-  var fresh = await readRange(SH, 'CS BREAK!A1:O1');
+  var fresh = await readRange(SH, 'CS BREAK!A:O');
   setCachedData(fresh);
   return fresh;
 }

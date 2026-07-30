@@ -90,7 +90,7 @@ async function processSyncQueue() {
                   currentRow.user_id || '', eTotal, '🟢 RETURNED',
                   currentRow.break_id || '', '🟢 RETURNED'
                 ];
-                var result = await withTimeout(breakAppendRow(SH, 'CS BREAK!A:O', fullRow), SYNC_TIMEOUT, 'breakAppendRow-end');
+                var result = await withTimeout(breakAppendRow(SH, 'CS BREAK!A1:O1', fullRow), SYNC_TIMEOUT, 'breakAppendRow-end');
                 if (result && result.updates && result.updates.updatedRange) {
                   var match = result.updates.updatedRange.match(/A(\d+):/);
                   var newRow = match ? parseInt(match[1], 10) : 0;
@@ -212,7 +212,7 @@ async function syncStartBreak(item) {
     item.break_id || '', '🔴 ON BREAK'
   ];
 
-  var result = await withTimeout(breakAppendRow(SH, 'CS BREAK!A:O', rowData), SYNC_TIMEOUT, 'breakAppendRow');
+  var result = await withTimeout(breakAppendRow(SH, 'CS BREAK!A1:O1', rowData), SYNC_TIMEOUT, 'breakAppendRow');
   if (result && result.updates && result.updates.updatedRange) {
     var match = result.updates.updatedRange.match(/A(\d+):/);
     var row = match ? parseInt(match[1], 10) : 0;

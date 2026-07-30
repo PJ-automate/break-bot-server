@@ -18,6 +18,11 @@ var SH = CONFIG.breakSheetId;
 
 // Reconcile throttle: reverse-sync GS → SQLite at most once per 60s
 var lastReconcileTime = 0;
+
+// In-flight sync tracker — prevents duplicate syncs from periodic worker
+// When inline syncBreakNow starts processing a break, its break_id is added here.
+// The periodic worker's processSyncQueue checks this set before processing.
+var inFlightSyncs = new Set();
 const RECONCILE_INTERVAL = 60000;
 
 /**
@@ -62,6 +67,12 @@ async function processSyncQueue() {
       if (!item || !item.break_id) continue;
 
       try {
+        // Skip if this break is currently being synced by the inline path
+        if (inFlightSyncs.has(item.break_id)) {
+          console.log('[SyncWorker] Break #' + item.break_id + ' is in-flight — skipping periodic sync');
+          continue;
+        }
+
         // For end syncs: if no sheet row yet, write complete break as new row
         if (item.operation === 'end') {
           // IMPORTANT: item.break_id is the human-readable ID (text) from b.break_id
@@ -446,10 +457,13 @@ function startSyncWorker(intervalMs) {
 async function syncBreakNow(breakRecord, operation) {
   if (!breakRecord) return;
   try {
-    // STEP 1: Delete queue entry FIRST — prevents periodic worker from racing
+    // STEP 1: Register as in-flight — prevents periodic worker from processing
+    inFlightSyncs.add(breakRecord.break_id);
+
+    // STEP 2: Delete queue entry — prevents periodic worker from finding it
     db.getDB().prepare("DELETE FROM sync_queue WHERE break_id = ?").run(breakRecord.id);
 
-    // STEP 2: Idempotency check — if already synced, skip
+    // STEP 3: Idempotency check — if already synced, skip
     if (operation === 'start' && breakRecord.google_sheet_row > 0) {
       console.log('[SyncWorker] Start #' + breakRecord.break_id + ' already at row ' + breakRecord.google_sheet_row + ' — skipping duplicate');
       return;
@@ -501,8 +515,9 @@ async function syncBreakNow(breakRecord, operation) {
     console.log('[SyncWorker] Inline synced ' + operation + ' #' + breakRecord.break_id + ' at row ' + (item.google_sheet_row || '?'));
   } catch (err) {
     console.warn('[SyncWorker] Inline sync failed for #' + (breakRecord.break_id || 'unknown') + ': ' + err.message);
-    // Queue entry was already deleted. On failure, the periodic worker won't retry.
-    // This is acceptable — the sync will be retried on next start/end command.
+  } finally {
+    // Remove from in-flight tracking — allows periodic worker to retry if failed
+    inFlightSyncs.delete(breakRecord.break_id);
   }
 }
 

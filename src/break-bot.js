@@ -542,8 +542,9 @@ async function handleBreakUpdate(update) {
     if (!db.getDB) db.initDB();
     try { db.getDB(); } catch(e) { db.initDB(); }
 
-    // Trigger sync worker (non-blocking — processes pending sheet syncs)
-    syncWorker.processSyncQueue().catch(function() {});
+    // Sync is handled by inline syncBreakNow in startBreak/endBreak.
+    // Periodic 5-second worker is the fallback for failed inline syncs.
+    // Do NOT call processSyncQueue here — it races with inline sync.
 
     // Callback query
     if (update.callback_query) {

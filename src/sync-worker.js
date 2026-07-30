@@ -19,10 +19,7 @@ var SH = CONFIG.breakSheetId;
 // Reconcile throttle: reverse-sync GS → SQLite at most once per 60s
 var lastReconcileTime = 0;
 
-// In-flight sync tracker — prevents duplicate syncs from periodic worker
-// When inline syncBreakNow starts processing a break, its break_id is added here.
-// The periodic worker's processSyncQueue checks this set before processing.
-var inFlightSyncs = new Set();
+// (inFlightSyncs Set removed — no longer needed with queue-only sync)
 const RECONCILE_INTERVAL = 60000;
 
 /**
@@ -67,12 +64,6 @@ async function processSyncQueue() {
       if (!item || !item.break_id) continue;
 
       try {
-        // Skip if this break is currently being synced by the inline path
-        if (inFlightSyncs.has(item.break_id)) {
-          console.log('[SyncWorker] Break #' + item.break_id + ' is in-flight — skipping periodic sync');
-          continue;
-        }
-
         // For end syncs: if no sheet row yet, write complete break as new row
         if (item.operation === 'end') {
           // IMPORTANT: item.break_id is the human-readable ID (text) from b.break_id
@@ -455,80 +446,7 @@ function startSyncWorker(intervalMs) {
   }, intervalMs);
 }
 
-/**
- * Sync a single break immediately, bypassing the queue.
- * Called directly from break-bot.js after a break is started or ended.
- * This provides near-instant Google Sheets updates (within API latency).
- */
-async function syncBreakNow(breakRecord, operation) {
-  if (!breakRecord) return;
-  try {
-    // STEP 1: Register as in-flight — prevents periodic worker from processing
-    inFlightSyncs.add(breakRecord.break_id);
-
-    // STEP 2: Idempotency check — if already synced, skip
-    if (operation === 'start' && breakRecord.google_sheet_row > 0) {
-      console.log('[SyncWorker] Start #' + breakRecord.break_id + ' already at row ' + breakRecord.google_sheet_row + ' — skipping duplicate');
-      return;
-    }
-
-    // Build item-like object from the break record
-    var item = {
-      break_id: breakRecord.break_id,
-      sq_break_id: breakRecord.id,
-      business_date: breakRecord.business_date,
-      user_name: breakRecord.user_name,
-      shift_type: breakRecord.shift_type,
-      shift_period: breakRecord.shift_period,
-      break_type: breakRecord.break_type,
-      start_time: breakRecord.start_time,
-      end_time: breakRecord.end_time,
-      duration_hms: breakRecord.duration_hms,
-      remaining: breakRecord.remaining,
-      remark: breakRecord.remark,
-      total_used_hms: breakRecord.total_used_hms,
-      user_id: breakRecord.user_id,
-      google_sheet_row: breakRecord.google_sheet_row,
-      status: breakRecord.status,
-      id: null,
-      payload: null
-    };
-
-    if (operation === 'start') {
-      await syncStartBreak(item);
-    } else if (operation === 'end') {
-      // For end sync: use stored google_sheet_row ONLY — never search
-      if (!item.google_sheet_row || item.google_sheet_row <= 0) {
-        throw new Error('No google_sheet_row for break #' + breakRecord.break_id);
-      }
-      await syncEndBreak(item);
-    } else {
-      return;
-    }
-
-    // Update google_sheet_row and mark synced
-    if (item.google_sheet_row > 0) {
-      db.getDB().prepare("UPDATE breaks SET google_sheet_row = ?, sync_status = 'synced' WHERE id = ?")
-        .run(item.google_sheet_row, breakRecord.id);
-    } else {
-      db.getDB().prepare("UPDATE breaks SET sync_status = 'synced' WHERE id = ?")
-        .run(breakRecord.id);
-    }
-
-    // Delete queue entry ONLY after GS call succeeds — preserves retry on failure
-    db.getDB().prepare("DELETE FROM sync_queue WHERE break_id = ?").run(breakRecord.id);
-
-    console.log('[SyncWorker] Inline synced ' + operation + ' #' + breakRecord.break_id + ' at row ' + (item.google_sheet_row || '?'));
-  } catch (err) {
-    console.warn('[SyncWorker] Inline sync failed for #' + (breakRecord.break_id || 'unknown') + ': ' + err.message);
-  } finally {
-    // Remove from in-flight tracking — allows periodic worker to retry if failed
-    inFlightSyncs.delete(breakRecord.break_id);
-  }
-}
-
 module.exports = {
   processSyncQueue,
-  startSyncWorker,
-  syncBreakNow
+  startSyncWorker
 };

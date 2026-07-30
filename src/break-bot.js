@@ -911,16 +911,8 @@ async function startBreak(chatId, userId, userName, shiftType, shiftPeriod, brea
     ).catch(() => {});
   }
 
-  // Inline sync — pushes to Google Sheets immediately
-  // Also handles queue cleanup — no need for separate processSyncQueue here
-  try {
-    var freshBreak = db.getDB().prepare('SELECT * FROM breaks WHERE id = ?').get(result.id);
-    if (freshBreak) {
-      syncWorker.syncBreakNow(freshBreak, 'start').catch(function(er) {
-        console.warn('[BreakBot] Inline start sync issue:', er.message.substring(0, 60));
-      });
-    }
-  } catch(e) {}
+  // Trigger sync worker (non-blocking — pushes to Google Sheets asynchronously)
+  syncWorker.processSyncQueue().catch(function() {});
 }
 
 // ============================================================
@@ -956,16 +948,8 @@ async function endBreak(chatId, userId, userName) {
     ).catch(function() {});
   }
 
-  // Inline sync — pushes to Google Sheets immediately
-  // Also handles queue cleanup — no need for separate processSyncQueue here
-  try {
-    var endedBreak = db.getDB().prepare('SELECT * FROM breaks WHERE id = ?').get(result.row.id);
-    if (endedBreak) {
-      syncWorker.syncBreakNow(endedBreak, 'end').catch(function(er) {
-        console.warn('[BreakBot] Inline end sync issue:', er.message.substring(0, 60));
-      });
-    }
-  } catch(e) {}
+  // Trigger sync worker (non-blocking — pushes to Google Sheets asynchronously)
+  syncWorker.processSyncQueue().catch(function() {});
 }
 
 // ============================================================

@@ -348,10 +348,14 @@ async function syncEndBreak(item) {
     throw new Error('No sheet row for break #' + item.break_id);
   }
 
-  // Verify row ownership before writing — SKIPPED during backlog clearance
-  // The CS BREAK sheet was rebuilt from SQLite with correct google_sheet_row values.
-  // Re-enable after queue is empty: replace with verifyAndRepairRow(item)
-  var verified = true;
+  // Verify row ownership before writing — ensures google_sheet_row is correct
+  // If the row has a different break_id, searches the sheet for the correct row
+  var verified = await verifyAndRepairRow(item);
+  if (!verified) {
+    throw new Error('Cannot locate break #' + item.break_id + ' in CS BREAK sheet');
+  }
+  // Update rowIndex in case verifyAndRepairRow found the break at a different row
+  rowIndex = item.google_sheet_row;
 
   var statusIcon = item.remark ? ('⚠️ ' + item.remark) : '🟢 RETURNED';
 

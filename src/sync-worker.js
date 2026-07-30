@@ -1,30 +1,24 @@
 /**
  * sync-worker.js — Background Google Sheet sync for Break Tracker.
- * Reads pending syncs from SQLite and pushes to Google Sheets.
- * Runs in background — never blocks user commands.
  *
- * FIXED July 2026: Handle "exceeds grid limits" error from archive resizing
+ * Two independent paths:
+ *   1. syncBreakRecord() — called inline from break-bot.js after SQLite commit.
+ *      Handles immediate GS write for new/ended breaks.
+ *   2. retryFailedSyncs() — called by periodic timer (every 5s).
+ *      Only processes records where sync_status = 'failed'.
+ *
+ * sync_status values: pending → syncing → synced / failed
  */
 'use strict';
 
 const db = require('./break-db');
 const coordinator = require('./coordinator');
 const CONFIG = require('./config');
-const { breakAppendRow, breakUpdateRange, updateRange, readRange, getOrCreateSheet, formatDate, getBreakSheetId, reapplyBreakNumberFormats } = require('./google');
+const { breakAppendRow, breakUpdateRange, readRange, getOrCreateSheet, formatDate } = require('./google');
 
 const SYNC_TIMEOUT = 120000; // 120s — OVH France has high latency to Google APIs
-var processing = false;
 var SH = CONFIG.breakSheetId;
 
-// Reconcile throttle: reverse-sync GS → SQLite at most once per 60s
-var lastReconcileTime = 0;
-
-// (inFlightSyncs Set removed — no longer needed with queue-only sync)
-const RECONCILE_INTERVAL = 60000;
-
-/**
- * Race a promise against a timeout.
- */
 function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
@@ -34,176 +28,10 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
-/**
- * Process pending sync operations in the background.
- * Called periodically and after each command.
- */
-async function processSyncQueue() {
-  if (processing) return;
+// ============================================================
+//  SYNC START BREAK — Append new row to CS BREAK
+// ============================================================
 
-  // Pause GS writes while archive is running (prevents row mapping corruption)
-  if (coordinator.isArchiveRunning()) {
-    coordinator.incrementDeferredSyncs();
-    console.log('[SyncWorker] Archive lock held — deferring sync');
-    return;
-  }
-
-  processing = true;
-
-  try {
-    var pending = db.getPendingSyncs();
-    if (!pending || pending.length === 0) {
-      processing = false;
-      return;
-    }
-
-    console.log('[SyncWorker] Processing ' + pending.length + ' pending sync(s)...');
-
-    for (var i = 0; i < pending.length; i++) {
-      var item = pending[i];
-      if (!item || !item.break_id) continue;
-
-      try {
-        // For end syncs: if no sheet row yet, write complete break as new row
-        if (item.operation === 'end') {
-          // IMPORTANT: item.break_id is the human-readable ID (text) from b.break_id
-          // The actual integer pk is in item.sq_break_id (from the column rename below)
-          var breakIntId = item.sq_break_id || (item.payload ? JSON.parse(item.payload).breakId : null);
-          if (!breakIntId) breakIntId = item.break_id; // fallback
-          var currentRow = null;
-          if (typeof breakIntId === 'number' || /^\d+$/.test(String(breakIntId))) {
-            currentRow = db.getDB().prepare('SELECT google_sheet_row, id, business_date, user_name, shift_type, shift_period, break_type, start_time, end_time, duration_hms, remaining, remark, total_used_hms, user_id, break_id FROM breaks WHERE id = ?').get(Number(breakIntId));
-          }
-          if (!currentRow || !currentRow.google_sheet_row || currentRow.google_sheet_row <= 0) {
-            // Start never synced — write complete break as a new row (start + end data)
-            if (currentRow && currentRow.google_sheet_row === 0) {
-              try {
-                var endData = JSON.parse(item.payload || '{}');
-                // Payload field names: timeStr, curHMS, remHMS, finalRemark, totalHMS
-                var eTime = endData.timeStr || currentRow.end_time || '';
-                var eDur = endData.curHMS || currentRow.duration_hms || '';
-                var eRem = endData.remHMS || endData.remaining || currentRow.remaining || '';
-                var eRemark = endData.finalRemark || currentRow.remark || '';
-                var eTotal = endData.totalHMS || currentRow.total_used_hms || '';
-                var fullRow = [
-                  currentRow.business_date || '', currentRow.user_name || '', currentRow.shift_type || '',
-                  currentRow.shift_period || '', currentRow.break_type || '', currentRow.start_time || '',
-                  eTime, eDur, eRem, eRemark,
-                  currentRow.user_id || '', eTotal, '🟢 RETURNED',
-                  currentRow.break_id || '', '🟢 RETURNED'
-                ];
-                var result = await withTimeout(breakAppendRow(SH, 'CS BREAK!A:O', fullRow), SYNC_TIMEOUT, 'breakAppendRow-end');
-                if (result && result.updates && result.updates.updatedRange) {
-                  var match = result.updates.updatedRange.match(/A(\d+):/);
-                  var newRow = match ? parseInt(match[1], 10) : 0;
-                  if (newRow > 0) {
-                    item.google_sheet_row = newRow;
-                    db.getDB().prepare('UPDATE breaks SET google_sheet_row = ? WHERE id = ?').run(newRow, item.sq_break_id);
-                    console.log('[SyncWorker] End break appended as new row ' + newRow + ' for #' + item.break_id);
-                    db.markSyncDone(item.id, item.sq_break_id, newRow);
-                    // Fire-and-forget daily summary update
-                    setTimeout(function() {
-                      try {
-                        var ds = require('./break-bot');
-                        if (typeof ds.updateDailySummary === 'function') {
-                          var dsDate = currentRow.business_date || '';
-                          var dsUser = currentRow.user_name || '';
-                          var dsShift = currentRow.shift_type || '';
-                          var dsPeriod = currentRow.shift_period || '';
-                          var dsTotal = eTotal || '';
-                          var dsRem = eRem || '';
-                          if (dsDate && dsUser) {
-                            ds.updateDailySummary(dsDate, dsUser, dsShift, dsPeriod, dsTotal, dsRem)
-                              .then(function() { console.log('[SyncWorker] Daily summary updated for ' + dsUser + ' ' + dsDate); })
-                              .catch(function(e) { console.warn('[SyncWorker] Daily summary update error (non-blocking):', e.message); });
-                          }
-                        }
-                      } catch(e) {
-                        console.warn('[SyncWorker] Daily summary import error (non-blocking):', e.message);
-                      }
-                    }, 100);
-                    continue;
-                  }
-                }
-              } catch (appendErr) {
-                console.warn('[SyncWorker] End fallback append failed for #' + item.break_id + ': ' + appendErr.message);
-                continue;
-              }
-            } else {
-              console.log('[SyncWorker] End #' + item.break_id + ' has no break record, skipping');
-              continue;
-            }
-          } else if (currentRow && currentRow.google_sheet_row > 0) {
-            item.google_sheet_row = currentRow.google_sheet_row;
-          }
-        }
-
-        if (item.operation === 'start') {
-          // Re-check google_sheet_row — inline sync may have just set it
-          var freshRow = db.getDB().prepare("SELECT google_sheet_row FROM breaks WHERE id = ?").get(item.sq_break_id);
-          if (freshRow && freshRow.google_sheet_row > 0) {
-            console.log('[SyncWorker] Start #' + item.break_id + ' already at row ' + freshRow.google_sheet_row + ' — periodic skip');
-            continue;
-          }
-          await syncStartBreak(item);
-        } else if (item.operation === 'end') {
-          await syncEndBreak(item);
-        }
-        db.markSyncDone(item.id, item.sq_break_id, item.google_sheet_row || 0);
-        console.log('[SyncWorker] Synced ' + item.operation + ' #' + item.break_id);
-
-        // After end break sync: check if violation (LONG BREAK or OVERBREAK) and write to OVERBREAK_TRACKER
-        if (item.operation === 'end' && (item.remark === 'LONG BREAK' || item.remark === 'OVERBREAK')) {
-          trackOverbreakViolation(item).catch(function(err) {
-            console.warn('[SyncWorker] Overbreak tracking error (non-blocking):', err.message);
-          });
-        }
-      } catch (err) {
-        db.markSyncFailed(item.id, err.message);
-        console.warn('[SyncWorker] Failed ' + item.operation + ' #' + item.break_id + ': ' + err.message);
-
-        // If the sheet row was deleted by archive, reset google_sheet_row so next retry re-appends
-        if (err.message && err.message.indexOf('exceeds grid limits') >= 0) {
-          try {
-            db.getDB().prepare('UPDATE breaks SET google_sheet_row = 0 WHERE id = ?').run(item.sq_break_id);
-            console.log('[SyncWorker] Reset google_sheet_row for #' + item.break_id + ' (grid limits after archive)');
-          } catch(e) {}
-        }
-
-        // Don't stop — continue to next item (each sync is independent)
-      }
-    }
-  } catch (err) {
-    console.error('[SyncWorker] Error:', err.message);
-  }
-
-  processing = false;
-
-  // Reverse-sync: check if any active breaks in SQLite were manually ended via GS Break Tools
-  // Runs at most once every 60s to avoid excessive API calls.
-  if (Date.now() - lastReconcileTime > RECONCILE_INTERVAL) {
-    lastReconcileTime = Date.now();
-    try {
-      await reconcileActiveBreaks();
-    } catch (rcErr) {
-      console.warn('[SyncWorker] Reconcile warning (non-blocking): ' + rcErr.message);
-    }
-  }
-}
-
-/**
- * Process ONE specific sync from a command callback (triggered inline).
- * Tries sync with a SHORTER timeout. If it fails, queues it for the periodic worker.
- */
-async function processSyncInline(operation, breakId) {
-  // For inline processing, just trigger the periodic worker
-  processSyncQueue().catch(function() {});
-}
-
-/**
- * Sync a start break operation to Google Sheets.
- * Appends a new row to CS BREAK sheet.
- */
 async function syncStartBreak(item) {
   if (!item.user_id) throw new Error('Missing user_id');
 
@@ -225,52 +53,30 @@ async function syncStartBreak(item) {
     var match = result.updates.updatedRange.match(/A(\d+):/);
     var row = match ? parseInt(match[1], 10) : 0;
     if (row > 0) {
-      item.google_sheet_row = row; // will be saved by markSyncDone
+      item.google_sheet_row = row;
       console.log('[SyncWorker] Start break appended at row ' + row);
     }
   }
 }
 
-/**
- * Sync an end break operation to Google Sheets.
- * Updates the existing row with end time, duration, etc.
- */
+// ============================================================
+//  SYNC END BREAK — Update existing row with end data
+// ============================================================
+
 async function syncEndBreak(item) {
-  // google_sheet_row is already set by processSyncQueue before calling this
   var rowIndex = item.google_sheet_row;
   if (!rowIndex || rowIndex <= 0) {
     throw new Error('No sheet row for break #' + item.break_id);
   }
 
-  // Row ownership verification is disabled for performance.
-  // The inline sync path processes immediately after the SQLite write,
-  // so google_sheet_row is always correct for the current break.
-  var verified = true;
-
   var statusIcon = item.remark ? ('⚠️ ' + item.remark) : '🟢 RETURNED';
 
-  // Get time values from the breaks table columns (b.end_time, b.duration_hms, etc.)
-  // NOTE: item.end_time = b.end_time, item.duration_hms = b.duration_hms (from SELECT)
   var endTimeStr = item.end_time || '';
   var durationStr = item.duration_hms || '';
   var remainingStr = item.remaining || '';
   var remarkStr = item.remark || '';
   var totalStr = item.total_used_hms || '';
 
-  // Try payload as fallback (contains raw command data)
-  // Payload has: timeStr, curHMS, remHMS, finalRemark, totalHMS
-  if (!endTimeStr || !durationStr) {
-    try {
-      var pl = JSON.parse(item.payload || '{}');
-      if (!endTimeStr) endTimeStr = pl.timeStr || '';
-      if (!durationStr) durationStr = pl.curHMS || '';
-      if (!remainingStr) remainingStr = pl.remHMS || '';
-      if (!remarkStr) remarkStr = pl.finalRemark || '';
-      if (!totalStr) totalStr = pl.totalHMS || '';
-    } catch(e) {}
-  }
-
-  // Send time as TEXT strings (HH:MM:SS)
   // Write G(End)-J(Remark): End Time, Duration, Remaining, Remark
   await withTimeout(breakUpdateRange(SH, 'CS BREAK!G' + rowIndex + ':J' + rowIndex, [[
     endTimeStr, durationStr, remainingStr, remarkStr
@@ -285,168 +91,196 @@ async function syncEndBreak(item) {
   await withTimeout(breakUpdateRange(SH, 'CS BREAK!O' + rowIndex, [[statusIcon]]), SYNC_TIMEOUT, 'breakUpdateRange O');
 
   console.log('[SyncWorker] End break updated at row ' + rowIndex);
+}
 
-  // Fire-and-forget daily summary update (non-blocking — does not affect sync retry loop)
-  setTimeout(function() {
-    try {
-      var ds = require('./break-bot');
-      if (typeof ds.updateDailySummary === 'function') {
-        var dsDate = item.business_date || '';
-        var dsUser = item.user_name || '';
-        var dsShift = item.shift_type || '';
-        var dsPeriod = item.shift_period || '';
-        var dsTotal = totalStr || '';
-        var dsRem = remainingStr || '';
-        if (dsDate && dsUser) {
-          ds.updateDailySummary(dsDate, dsUser, dsShift, dsPeriod, dsTotal, dsRem)
-            .then(function() { console.log('[SyncWorker] Daily summary updated for ' + dsUser + ' ' + dsDate); })
-            .catch(function(e) { console.warn('[SyncWorker] Daily summary update error (non-blocking):', e.message); });
+// ============================================================
+//  SYNC BREAK RECORD — Bridge between break record and GS write
+//  Called inline from break-bot.js after SQLite commit.
+//  Manages sync_status: pending → syncing → synced / failed
+// ============================================================
+
+async function syncBreakRecord(breakRecord) {
+  if (!breakRecord || !breakRecord.id) return;
+
+  // Set syncing status (prevents retry worker from picking it up)
+  db.getDB().prepare("UPDATE breaks SET sync_status = 'syncing' WHERE id = ?").run(breakRecord.id);
+
+  // Determine operation type from break state
+  var isEnd = (breakRecord.status === 'ENDED' && breakRecord.end_time);
+  var operation = isEnd ? 'end' : 'start';
+
+  try {
+    // Build item from break record
+    var item = {
+      break_id: breakRecord.break_id,
+      id: breakRecord.id,
+      business_date: breakRecord.business_date,
+      user_name: breakRecord.user_name,
+      shift_type: breakRecord.shift_type,
+      shift_period: breakRecord.shift_period,
+      break_type: breakRecord.break_type,
+      start_time: breakRecord.start_time,
+      end_time: breakRecord.end_time,
+      duration_hms: breakRecord.duration_hms,
+      remaining: breakRecord.remaining,
+      remark: breakRecord.remark,
+      total_used_hms: breakRecord.total_used_hms,
+      user_id: breakRecord.user_id,
+      google_sheet_row: breakRecord.google_sheet_row,
+      status: breakRecord.status,
+      payload: null
+    };
+
+    if (operation === 'start') {
+      await syncStartBreak(item);
+    } else {
+      // For end sync: if no sheet row yet, append complete row (start + end in one)
+      if (!item.google_sheet_row || item.google_sheet_row <= 0) {
+        var fullRow = [
+          breakRecord.business_date || '', breakRecord.user_name || '', breakRecord.shift_type || '',
+          breakRecord.shift_period || '', breakRecord.break_type || '', breakRecord.start_time || '',
+          breakRecord.end_time || '', breakRecord.duration_hms || '', breakRecord.remaining || '',
+          breakRecord.remark || '', breakRecord.user_id || '', breakRecord.total_used_hms || '',
+          '🟢 RETURNED', breakRecord.break_id || '', '🟢 RETURNED'
+        ];
+        var result = await withTimeout(breakAppendRow(SH, 'CS BREAK!A:O', fullRow), SYNC_TIMEOUT, 'breakAppendRow-end');
+        if (result && result.updates && result.updates.updatedRange) {
+          var match = result.updates.updatedRange.match(/A(\d+):/);
+          var newRow = match ? parseInt(match[1], 10) : 0;
+          if (newRow > 0) {
+            item.google_sheet_row = newRow;
+            console.log('[SyncWorker] End break appended as complete row ' + newRow);
+          }
         }
+      } else {
+        await syncEndBreak(item);
       }
-    } catch(e) {
-      console.warn('[SyncWorker] Daily summary import error (non-blocking):', e.message);
     }
-  }, 100);
 
-}
+    // Success: update google_sheet_row and sync_status
+    if (item.google_sheet_row > 0) {
+      db.getDB().prepare("UPDATE breaks SET google_sheet_row = ?, sync_status = 'synced' WHERE id = ?")
+        .run(item.google_sheet_row, breakRecord.id);
+    } else {
+      db.getDB().prepare("UPDATE breaks SET sync_status = 'synced' WHERE id = ?")
+        .run(breakRecord.id);
+    }
 
-/**
- * Convert time string "HH:MM:SS" to Google Sheets serial number.
- */
-function timeStringToSerial(timeStr) {
-  if (!timeStr || !timeStr.includes(':')) return 0;
-  var parts = timeStr.split(':').map(Number);
-  return ((parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0)) / 86400;
-}
+    // Log success
+    var logRow = item.google_sheet_row || '?';
+    if (operation === 'start') {
+      console.log('[SyncWorker] Synced start #' + breakRecord.break_id + ' at row ' + logRow);
+    } else {
+      console.log('[SyncWorker] Synced end #' + breakRecord.break_id + ' at row ' + logRow);
+    }
+    return true;
 
-/**
- * Track overbreak violations to OVERBREAK_TRACKER sheet.
- * Called after an end-break sync completes when remark is LONG BREAK or OVERBREAK.
- * Writes: Date, User Name, User ID, Shift, Period, Break Type (+violation type),
- *         Time Range, Duration, Total Break Used
- */
-async function trackOverbreakViolation(item) {
-  try {
-    // Ensure OVERBREAK_TRACKER sheet exists
-    await getOrCreateSheet(SH, 'OVERBREAK_TRACKER');
-
-    var now = new Date();
-    var dateStr = formatDate(now, 'yyyy-MM-dd HH:mm:ss');
-    var startEnd = (item.start_time || '') + ' → ' + (item.end_time || '');
-    var violationLabel = item.remark === 'OVERBREAK' ? 'OVERBREAK' : 'LONG BREAK';
-
-    await breakAppendRow(SH, 'OVERBREAK_TRACKER!A:I', [
-      dateStr,
-      item.user_name || '',
-      item.user_id || '',
-      item.shift_type || '',
-      item.shift_period || '',
-      (item.break_type || '') + ' (' + violationLabel + ')',
-      startEnd,
-      item.duration_hms || '',
-      item.total_used_hms || ''
-    ]);
-    console.log('[SyncWorker] Violation tracked to OVERBREAK_TRACKER: ' + violationLabel + ' for ' + item.user_name);
   } catch (err) {
-    // Non-critical — don't let it affect the main sync flow
-    console.warn('[SyncWorker] trackOverbreakViolation failed:', err.message);
+    // Failure: mark as failed (retry worker will pick it up)
+    db.getDB().prepare("UPDATE breaks SET sync_status = 'failed' WHERE id = ?")
+      .run(breakRecord.id);
+    console.warn('[SyncWorker] Sync failed for #' + breakRecord.break_id + ': ' + err.message);
+    return false;
   }
 }
 
 // ============================================================
-//  REVERSE SYNC: Reconcile breaks ended via GS Break Tools
+//  RETRY FAILED SYNCS — Periodic, processes only failed records
+//  Independent from syncBreakRecord — no overlap possible
 // ============================================================
 
-/**
- * Reverse-sync: Check if any breaks that are ON BREAK in SQLite have been
- * manually ended in Google Sheets (via Break Tools or direct editing).
- * If found, update SQLite to match the sheet.
- *
- * Lightweight version — only reads columns M (status) and N (break_id)
- * from the sheet to minimize API overhead.
- */
-async function reconcileActiveBreaks() {
-  // Get all active breaks from SQLite
-  var activeBreaks = db.getAllActiveBreaks();
-  if (!activeBreaks || activeBreaks.length === 0) return;
+async function retryFailedSyncs() {
+  // Pause if archive is running
+  if (coordinator.isArchiveRunning()) return;
 
-  // Read only columns M (status) and N (break_id) from CS BREAK
-  var data;
-  try {
-    data = await withTimeout(readRange(SH, 'CS BREAK!M:N'), 30000, 'reconcileRead');
-  } catch (e) {
-    return; // Silently skip on timeout — will retry next cycle
-  }
-  if (!data || data.length < 2) return;
+  var failed = db.getDB().prepare("SELECT * FROM breaks WHERE sync_status = 'failed' LIMIT 20").all();
+  if (failed.length === 0) return;
 
-  // Build break_id → sheet status map
-  var sheetMap = {};
-  for (var i = 1; i < data.length; i++) {
-    var row = data[i];
-    if (row && row[1]) { // column N = index 1 in M:N range
-      sheetMap[String(row[1]).trim()] = { status: String(row[0] || '').trim(), sheetRow: i + 1 };
-    }
-  }
+  console.log('[SyncWorker] Retrying ' + failed.length + ' failed sync(s)...');
 
-  var reconciled = 0;
-  for (var b = 0; b < activeBreaks.length; b++) {
-    var br = activeBreaks[b];
-    var match = sheetMap[br.break_id];
-    if (!match) continue;
+  for (var i = 0; i < failed.length; i++) {
+    var b = failed[i];
 
-    var sheetStatus = match.status;
-    // Sheet shows ended but SQLite says active → reconcile
-    if (sheetStatus.indexOf('RETURNED') >= 0 || sheetStatus.indexOf('OVERBREAK') >= 0 || sheetStatus.indexOf('LONG BREAK') >= 0) {
-      try {
-        // Read the full row data for this break
-        var fullRowRes = await withTimeout(readRange(SH, 'CS BREAK!A' + match.sheetRow + ':O' + match.sheetRow), 15000, 'reconcileFullRead');
-        if (!fullRowRes || !fullRowRes[0]) continue;
-        var fullRow = fullRowRes[0];
+    // Re-check: inline sync may have just synced it
+    if (b.sync_status !== 'failed') continue;
 
-        var endTime = String(fullRow[6] || '').trim();
-        var durationHMS = String(fullRow[7] || '').trim();
-        var remaining = String(fullRow[8] || '').trim();
-        var remark = String(fullRow[9] || '').trim();
-        var totalUsed = String(fullRow[11] || '').trim();
+    try {
+      var item = {
+        break_id: b.break_id,
+        id: b.id,
+        business_date: b.business_date,
+        user_name: b.user_name,
+        shift_type: b.shift_type,
+        shift_period: b.shift_period,
+        break_type: b.break_type,
+        start_time: b.start_time,
+        end_time: b.end_time,
+        duration_hms: b.duration_hms,
+        remaining: b.remaining,
+        remark: b.remark,
+        total_used_hms: b.total_used_hms,
+        user_id: b.user_id,
+        google_sheet_row: b.google_sheet_row,
+        payload: null
+      };
 
-        var durParts = durationHMS.split(':').map(Number);
-        var durSecs = (durParts[0] || 0) * 3600 + (durParts[1] || 0) * 60 + (durParts[2] || 0);
+      db.getDB().prepare("UPDATE breaks SET sync_status = 'syncing' WHERE id = ?").run(b.id);
 
-        db.getDB().prepare(`
-          UPDATE breaks SET end_time = ?, duration_hms = ?, duration_secs = ?,
-            remaining = ?, remark = ?, total_used_hms = ?, google_sheet_row = ?,
-            status = 'ENDED', sync_status = 'synced'
-          WHERE id = ? AND status = 'ON BREAK'
-        `).run(endTime, durationHMS, durSecs, remaining, remark, totalUsed, match.sheetRow, br.id);
-
-        reconciled++;
-        console.log('[SyncWorker] ✓ Reconciled #' + br.id + ' ' + br.user_name + ' (' + br.break_type + ') → ' + sheetStatus + ' end:' + endTime);
-      } catch (e) {
-        console.warn('[SyncWorker] Reconcile row read failed for #' + br.id + ': ' + e.message);
+      if (b.status === 'ENDED' && b.end_time) {
+        // End sync
+        if (!item.google_sheet_row || item.google_sheet_row <= 0) {
+          // Append complete row (never had a sheet row)
+          var fullRow = [
+            b.business_date||'', b.user_name||'', b.shift_type||'', b.shift_period||'',
+            b.break_type||'', b.start_time||'', b.end_time||'', b.duration_hms||'',
+            b.remaining||'', b.remark||'', b.user_id||'', b.total_used_hms||'',
+            '🟢 RETURNED', b.break_id||'', '🟢 RETURNED'
+          ];
+          var r = await withTimeout(breakAppendRow(SH, 'CS BREAK!A:O', fullRow), SYNC_TIMEOUT, 'breakAppendRow-retry');
+          if (r && r.updates && r.updates.updatedRange) {
+            var m = r.updates.updatedRange.match(/A(\d+):/);
+            item.google_sheet_row = m ? parseInt(m[1], 10) : 0;
+          }
+        } else {
+          await syncEndBreak(item);
+        }
+      } else {
+        // Start sync
+        await syncStartBreak(item);
       }
-    }
-  }
 
-  if (reconciled > 0) {
-    console.log('[SyncWorker] ✅ Reverse-sync complete: ' + reconciled + ' break(s) reconciled from GS to SQLite');
+      // Mark synced
+      if (item.google_sheet_row > 0) {
+        db.getDB().prepare("UPDATE breaks SET google_sheet_row = ?, sync_status = 'synced' WHERE id = ?")
+          .run(item.google_sheet_row, b.id);
+      } else {
+        db.getDB().prepare("UPDATE breaks SET sync_status = 'synced' WHERE id = ?").run(b.id);
+      }
+      console.log('[SyncWorker] Retry success #' + b.break_id + ' row=' + (item.google_sheet_row || '?'));
+
+    } catch (err) {
+      db.getDB().prepare("UPDATE breaks SET sync_status = 'failed' WHERE id = ?").run(b.id);
+      console.warn('[SyncWorker] Retry failed for #' + b.break_id + ': ' + err.message);
+    }
   }
 }
 
-/**
- * Start the sync worker interval.
- */
+// ============================================================
+//  START SYNC WORKER — Periodic timer
+//  Only calls retryFailedSyncs — never touches pending records
+// ============================================================
+
 function startSyncWorker(intervalMs) {
-  intervalMs = intervalMs || 5000; // default: every 5 seconds
+  intervalMs = intervalMs || 5000;
   console.log('[SyncWorker] Started (interval: ' + intervalMs + 'ms)');
-  // Process immediately on start
-  processSyncQueue().catch(function() {});
-  // Then every N seconds
+  console.log('[SyncWorker] Normal sync: inline via syncBreakRecord after SQLite');
+  console.log('[SyncWorker] Retry timer: failed records only');
   return setInterval(function() {
-    processSyncQueue().catch(function() {});
+    retryFailedSyncs().catch(function() {});
   }, intervalMs);
 }
 
 module.exports = {
-  processSyncQueue,
+  syncBreakRecord,
   startSyncWorker
 };

@@ -542,9 +542,8 @@ async function handleBreakUpdate(update) {
     if (!db.getDB) db.initDB();
     try { db.getDB(); } catch(e) { db.initDB(); }
 
-    // Sync is handled by inline syncBreakNow in startBreak/endBreak.
-    // Periodic 5-second worker is the fallback for failed inline syncs.
-    // Do NOT call processSyncQueue here — it races with inline sync.
+    // Sync is handled by syncBreakRecord in startBreak/endBreak.
+    // The 5-second retry timer only processes failed records.
 
     // Callback query
     if (update.callback_query) {
@@ -911,8 +910,13 @@ async function startBreak(chatId, userId, userName, shiftType, shiftPeriod, brea
     ).catch(() => {});
   }
 
-  // Trigger sync worker (non-blocking — pushes to Google Sheets asynchronously)
-  syncWorker.processSyncQueue().catch(function() {});
+  // Sync to Google Sheets immediately (non-blocking — does not delay Telegram)
+  try {
+    var freshBreak = db.getDB().prepare('SELECT * FROM breaks WHERE id = ?').get(result.id);
+    if (freshBreak) syncWorker.syncBreakRecord(freshBreak).catch(function(er) {
+      if (er && er.message) console.warn('[BreakBot] Sync issue:', er.message.substring(0, 60));
+    });
+  } catch(e) {}
 }
 
 // ============================================================
@@ -948,8 +952,13 @@ async function endBreak(chatId, userId, userName) {
     ).catch(function() {});
   }
 
-  // Trigger sync worker (non-blocking — pushes to Google Sheets asynchronously)
-  syncWorker.processSyncQueue().catch(function() {});
+  // Sync to Google Sheets immediately (non-blocking — does not delay Telegram)
+  try {
+    var endedBreak = db.getDB().prepare('SELECT * FROM breaks WHERE id = ?').get(result.row.id);
+    if (endedBreak) syncWorker.syncBreakRecord(endedBreak).catch(function(er) {
+      if (er && er.message) console.warn('[BreakBot] Sync issue:', er.message.substring(0, 60));
+    });
+  } catch(e) {}
 }
 
 // ============================================================

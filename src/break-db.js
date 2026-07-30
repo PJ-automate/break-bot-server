@@ -126,13 +126,7 @@ function startBreak(businessDate, userName, shiftType, shiftPeriod, breakType, s
     VALUES (?, ?, ?, ?, ?, ?, ?, 'ON BREAK', ?, 'pending')
   `).run(businessDate, userName, shiftType, shiftPeriod, breakType, startTime, userId, breakId);
 
-  // Queue sync for this break
-  queueSync('start', info.lastInsertRowid, {
-    bd: businessDate, userName: userName, shiftType: shiftType,
-    shiftPeriod: shiftPeriod, breakType: breakType, timeStr: startTime,
-    userId: userId, breakId: breakId
-  });
-
+  // Sync is handled by sync-worker inline after SQLite commit
   return { id: info.lastInsertRowid, breakId: breakId };
 }
 
@@ -196,14 +190,7 @@ function endBreak(userId, endTimeStr) {
     WHERE id = ?
   `).run(endTimeStr, diffSecs, curHMS, remHMS, remark, totalHMS, active.id);
 
-  // Queue sync
-  queueSync('end', active.id, {
-    rowIndex: active.google_sheet_row || 0,
-    timeStr: endTimeStr, curHMS: curHMS, remHMS: remHMS,
-    finalRemark: remark || '', totalHMS: totalHMS,
-    bd: active.business_date, userName: active.user_name,
-    shiftType: active.shift_type, shiftPeriod: active.shift_period
-  });
+  // Sync is handled by sync-worker inline after SQLite commit
 
   // Immediately update daily_summary_cache so DAILY SUMMARY data is never lost
   // even if the background sheet write times out

@@ -199,6 +199,12 @@ async function processSyncInline(operation, breakId) {
 async function syncStartBreak(item) {
   if (!item.user_id) throw new Error('Missing user_id');
 
+  // Idempotency: if google_sheet_row already set, this break was already synced
+  if (item.google_sheet_row > 0) {
+    console.log('[SyncWorker] Start #' + item.break_id + ' already at row ' + item.google_sheet_row + ' — skipping duplicate');
+    return;
+  }
+
   var rowData = [
     item.business_date || '', item.user_name || '', item.shift_type || '',
     item.shift_period || '', item.break_type || '', item.start_time || '',
@@ -440,6 +446,15 @@ function startSyncWorker(intervalMs) {
 async function syncBreakNow(breakRecord, operation) {
   if (!breakRecord) return;
   try {
+    // STEP 1: Delete queue entry FIRST — prevents periodic worker from racing
+    db.getDB().prepare("DELETE FROM sync_queue WHERE break_id = ?").run(breakRecord.id);
+
+    // STEP 2: Idempotency check — if already synced, skip
+    if (operation === 'start' && breakRecord.google_sheet_row > 0) {
+      console.log('[SyncWorker] Start #' + breakRecord.break_id + ' already at row ' + breakRecord.google_sheet_row + ' — skipping duplicate');
+      return;
+    }
+
     // Build item-like object from the break record
     var item = {
       break_id: breakRecord.break_id,
@@ -465,13 +480,16 @@ async function syncBreakNow(breakRecord, operation) {
     if (operation === 'start') {
       await syncStartBreak(item);
     } else if (operation === 'end') {
-      // Skip verify for inline sync (just confirmed correct)
+      // For end sync: use stored google_sheet_row ONLY — never search
+      if (!item.google_sheet_row || item.google_sheet_row <= 0) {
+        throw new Error('No google_sheet_row for break #' + breakRecord.break_id);
+      }
       await syncEndBreak(item);
     } else {
       return;
     }
 
-    // Update google_sheet_row and mark synced (no queue entry to delete)
+    // Update google_sheet_row and mark synced
     if (item.google_sheet_row > 0) {
       db.getDB().prepare("UPDATE breaks SET google_sheet_row = ?, sync_status = 'synced' WHERE id = ?")
         .run(item.google_sheet_row, breakRecord.id);
@@ -480,13 +498,11 @@ async function syncBreakNow(breakRecord, operation) {
         .run(breakRecord.id);
     }
 
-    // Also remove any queued sync for this break to prevent duplicate processing
-    db.getDB().prepare("DELETE FROM sync_queue WHERE break_id = ?").run(breakRecord.id);
-
     console.log('[SyncWorker] Inline synced ' + operation + ' #' + breakRecord.break_id + ' at row ' + (item.google_sheet_row || '?'));
   } catch (err) {
     console.warn('[SyncWorker] Inline sync failed for #' + (breakRecord.break_id || 'unknown') + ': ' + err.message);
-    // Queue entry remains in sync_queue for retry by periodic worker
+    // Queue entry was already deleted. On failure, the periodic worker won't retry.
+    // This is acceptable — the sync will be retried on next start/end command.
   }
 }
 

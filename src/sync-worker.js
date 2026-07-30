@@ -134,27 +134,13 @@ async function syncBreakRecord(breakRecord) {
     if (operation === 'start') {
       await syncStartBreak(item);
     } else {
-      // For end sync: if no sheet row yet, append complete row (start + end in one)
+      // End sync: must have a sheet row from the start sync
+      // If google_sheet_row is 0, the start sync never completed.
+      // Mark as failed — the retry worker will handle recovery.
       if (!item.google_sheet_row || item.google_sheet_row <= 0) {
-        var fullRow = [
-          breakRecord.business_date || '', breakRecord.user_name || '', breakRecord.shift_type || '',
-          breakRecord.shift_period || '', breakRecord.break_type || '', breakRecord.start_time || '',
-          breakRecord.end_time || '', breakRecord.duration_hms || '', breakRecord.remaining || '',
-          breakRecord.remark || '', breakRecord.user_id || '', breakRecord.total_used_hms || '',
-          '🟢 RETURNED', breakRecord.break_id || '', '🟢 RETURNED'
-        ];
-        var result = await withTimeout(breakAppendRow(SH, 'CS BREAK!A:O', fullRow), SYNC_TIMEOUT, 'breakAppendRow-end');
-        if (result && result.updates && result.updates.updatedRange) {
-          var match = result.updates.updatedRange.match(/A(\d+):/);
-          var newRow = match ? parseInt(match[1], 10) : 0;
-          if (newRow > 0) {
-            item.google_sheet_row = newRow;
-            console.log('[SyncWorker] End break appended as complete row ' + newRow);
-          }
-        }
-      } else {
-        await syncEndBreak(item);
+        throw new Error('No sheet row for break #' + breakRecord.break_id + ' — start sync may have failed');
       }
+      await syncEndBreak(item);
     }
 
     // Success: update google_sheet_row and sync_status

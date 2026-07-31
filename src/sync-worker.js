@@ -48,7 +48,7 @@ async function syncStartBreak(item) {
     item.break_id || '', '🔴 ON BREAK'
   ];
 
-  var result = await withTimeout(breakAppendRow(SH, 'CS BREAK!A:O', rowData), SYNC_TIMEOUT, 'breakAppendRow');
+  var result = await withTimeout(breakAppendRow(SH, 'CS BREAK!A1:O1', rowData), SYNC_TIMEOUT, 'breakAppendRow');
   if (result && result.updates && result.updates.updatedRange) {
     var match = result.updates.updatedRange.match(/A(\d+):/);
     var row = match ? parseInt(match[1], 10) : 0;
@@ -260,7 +260,7 @@ async function retryFailedSyncs() {
             b.remaining||'', b.remark||'', b.user_id||'', b.total_used_hms||'',
             '🟢 RETURNED', b.break_id||'', '🟢 RETURNED'
           ];
-          var r = await withTimeout(breakAppendRow(SH, 'CS BREAK!A:O', fullRow), SYNC_TIMEOUT, 'breakAppendRow-retry');
+          var r = await withTimeout(breakAppendRow(SH, 'CS BREAK!A1:O1', fullRow), SYNC_TIMEOUT, 'breakAppendRow-retry');
           if (r && r.updates && r.updates.updatedRange) {
             var m = r.updates.updatedRange.match(/A(\d+):/);
             item.google_sheet_row = m ? parseInt(m[1], 10) : 0;

@@ -375,7 +375,7 @@ async function getBreakSheet() {
   // Create CS BREAK sheet if missing
   var bs = await getOrCreateSheet(SH, 'CS BREAK');
   if (bs.created) {
-    await updateRange(SH, 'CS BREAK!A:O', [[
+    await updateRange(SH, 'CS BREAK!A1:O1', [[
       'Date','Name','Shift','Period','Break Type','Start Time',
       'End Time','Duration','Remaining','Remark','User ID','Total Used','Status','Break ID','Notes'
     ]]);
@@ -407,7 +407,7 @@ async function appendBreakRow(values) {
   if (raw[0]) raw[0] = dateToSerial(raw[0]);         // column A: date → serial
   if (raw[5]) raw[5] = timeToSerial(raw[5]);         // column F: start time → serial
   try {
-    const res = await breakAppendRow(SH, 'CS BREAK!A:O', raw);
+    const res = await breakAppendRow(SH, 'CS BREAK!A1:O1', raw);
     // Extract row number from response: "CS BREAK!A16:O16" → 16
     const range = res?.updates?.updatedRange || '';
     const match = range.match(/A(\d+):/);

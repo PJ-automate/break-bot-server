@@ -158,7 +158,7 @@ async function replayStart(entry, bot) {
   // breakAppendRow returns the raw Google API response:
   // { spreadsheetId: "...", updates: { updatedRange: "CS BREAK!A369:O369", ... } }
   // Extract the row number from updatedRange.
-  var result = await breakAppendRow(SH, 'CS BREAK!A:O', [
+  var result = await breakAppendRow(SH, 'CS BREAK!A1:O1', [
     d.bd, d.userName, d.shiftType, d.shiftPeriod, d.breakType, d.timeStr,
     '', '', '', '', d.userId, '', '🔴 ON BREAK', d.breakId, '🔴 ON BREAK'
   ]);

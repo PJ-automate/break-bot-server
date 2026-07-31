@@ -125,7 +125,7 @@ Agent sends /end in break group
 CS BREAK (15 columns: A-O)
   ├── Writes: syncStartBreak (append), syncEndBreak (update)
   ├── Reads: Only from reconcileActiveBreaks (archive worker)
-  └── Grid: Should be 15 columns (currently 29 due to failed resize)
+  └── Grid: 15 columns (was 29 — resized to 15 on 2026-08-01; deleteDimension succeeds on retry)
 
 ARCHIVES (15 columns: A-O)
   └── Writes: archive-worker at midnight
@@ -200,6 +200,6 @@ All `breakAppendRow` calls to CS BREAK use **`A1:O1`** instead of `A:O`.
 
 | Issue | Status |
 |-------|--------|
-| **Grid is 29 columns** | Column delete returns 503 from Google. Retry when API is stable. |
+| **Grid was 29 columns** | ✅ RESOLVED 2026-08-01 — deleteDimension now succeeds on retry (first attempt hit transient `The service is currently unavailable`). CS BREAK is now 15 columns (A:O). Root cause was transient Google API availability + OVH→Google latency, NOT the JSON key. |
 | **GS reads from OVH** | Consistent timeouts. Network issue between OVH France and Google. |
 | **Archive not working** | readRange times out. Sheet is small enough now (300+ rows) that a retry may succeed. |

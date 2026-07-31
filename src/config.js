@@ -14,7 +14,9 @@ const CONFIG = {
   breakGroupId: process.env.BREAK_GROUP_ID || '',
 
   // Break Bot Google Service Account (independent quota pool)
-  breakServiceAccountPath: process.env.BREAK_SERVICE_ACCOUNT_PATH || '',
+  // Resolve relative to project root so require() works from any module dir
+  // (e.g. './break-bot-key.json' from src/ would otherwise miss the file).
+  breakServiceAccountPath: path.resolve(__dirname, '..', process.env.BREAK_SERVICE_ACCOUNT_PATH || ''),
 
   // Server
   port: parseInt(process.env.BREAK_SERVER_PORT, 10) || 3004,

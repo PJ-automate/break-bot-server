@@ -552,14 +552,38 @@ function updateSheetRow(breakId, sheetRow) {
 }
 
 /**
- * Get all ON BREAK breaks from previous business dates (for auto-close).
+ * Get all ON BREAK breaks that should be auto-closed at the current shift boundary.
+ *
+ * Before noon (phHour < 12): closes previous-date breaks (day shift from yesterday).
+ * After noon (phHour >= 12): ALSO closes same-day NightShift breaks (night shift just ended).
+ *
+ * @param {string} todayStr - Today's PH date (YYYY-MM-DD)
+ * @param {number} phHour - Current PH hour (0-23)
  * @returns {Array}
  */
-function getStaleActiveBreaks(todayStr) {
+function getStaleActiveBreaksForShift(todayStr, phHour) {
   const d = getDB();
+  if (phHour >= 12) {
+    // After noon: previous-date breaks + today's NightShift breaks
+    return d.prepare(`
+      SELECT * FROM breaks WHERE status = 'ON BREAK'
+        AND (business_date < ? OR (business_date = ? AND shift_period = 'NightShift'))
+    `).all(todayStr, todayStr);
+  }
+  // Before noon: only previous-date breaks
   return d.prepare(`
     SELECT * FROM breaks WHERE status = 'ON BREAK' AND business_date < ?
   `).all(todayStr);
+}
+
+/**
+ * Get all ON BREAK breaks from previous business dates (for auto-close).
+ * Kept for backward compatibility — delegates to getStaleActiveBreaksForShift.
+ * @param {string} todayStr - Today's PH date (YYYY-MM-DD)
+ * @returns {Array}
+ */
+function getStaleActiveBreaks(todayStr) {
+  return getStaleActiveBreaksForShift(todayStr, 0);
 }
 
 function closeDB() {
@@ -596,5 +620,5 @@ module.exports = {
   getSummaryCache, setSummaryCache, getSummaryCacheByDate,
   clearSummaryCache, importSummaryCacheFromSheet,
   getSetting, setSetting,
-  endBreakAuto, updateSheetRow, getStaleActiveBreaks
+  endBreakAuto, updateSheetRow, getStaleActiveBreaks, getStaleActiveBreaksForShift
 };

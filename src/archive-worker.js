@@ -96,6 +96,11 @@ let running = false;
 // Track whether auto-close already ran today (runs once per day to avoid redundant SQLite writes)
 let autoCloseToday = '';
 
+// Track whether the noon (after-noon) auto-close already ran for this date.
+// Separates the 12:00 AM boundary (day-shift close) from the 12:00 PM
+// boundary (night-shift close) so both can run once per calendar date.
+let autoCloseRanNoon = '';
+
 /**
  * Get today's date in PH time as YYYY-MM-DD string.
  */
@@ -586,48 +591,78 @@ async function cleanupArchives(ssId) {
 // ============================================================
 
 /**
- * Auto-close breaks that are still ON BREAK from previous business dates.
- * These breaks were never ended via /end command and are still marked
- * as active in SQLite. The GS rows have already been archived.
+ * Auto-close breaks that are still ON BREAK at a shift boundary.
  *
- * This runs before archive to ensure:
- *  1. Dashboard stops showing them as active
- *  2. Archive moves the completed breaks to ARCHIVES
- *  3. Total used is properly calculated for the correct business date
+ * Two triggers:
+ *   1. Before noon (12:00 AM - 11:59 AM): closes previous-date breaks
+ *      (day shift from yesterday that never ended).
+ *   2. After noon (12:00 PM - 11:59 PM): ALSO closes today's NightShift
+ *      breaks (night shift just ended at 12:00 PM).
  *
- * Uses endBreakAuto() which does NOT queue a GS sync (rows already archived).
+ * This prevents staff from showing ON BREAK after their shift ended.
+ * Same-day NightShift breaks also get their GS row updated to RETURNED.
  */
 async function autoCloseStaleBreaks() {
   const ts = _logTimestamp();
   const todayStr = getPHDateStr();
+  const phHour = getPHTimeComponents().hours;
+  const isAfterNoon = phHour >= 12;
 
-  // Skip if already ran today
-  if (autoCloseToday === todayStr) return;
+  // Two-part guard: run once before noon, once after noon, per calendar date
+  if (isAfterNoon) {
+    if (autoCloseRanNoon === todayStr) return;
+    autoCloseRanNoon = todayStr;
+  } else {
+    if (autoCloseToday === todayStr) return;
+    autoCloseToday = todayStr;
+  }
 
   var db = require('./break-db');
-  var staleBreaks = db.getStaleActiveBreaks(todayStr);
+  var staleBreaks = db.getStaleActiveBreaksForShift(todayStr, phHour);
 
   if (!staleBreaks || staleBreaks.length === 0) {
-    autoCloseToday = todayStr;
+    console.log(ts + ' [ArchiveWorker] Auto-close check: no stale breaks (afterNoon=' + isAfterNoon + ')');
     return;
   }
 
-  console.log(ts + ' [ArchiveWorker] Auto-closing ' + staleBreaks.length + ' stale break(s) from previous date(s)...');
+  const ssId = CONFIG.breakSheetId;
+
+  console.log(ts + ' [ArchiveWorker] Auto-closing ' + staleBreaks.length + ' stale break(s)...');
 
   for (var i = 0; i < staleBreaks.length; i++) {
     var b = staleBreaks[i];
     try {
-      // Close at 23:59:59 of the business date (end of shift)
-      var result = db.endBreakAuto(b, '23:59:59');
+      // Same-day NightShift break → close at noon (12:00:00)
+      // Previous-date break → close at end of day (23:59:59)
+      var isSameDayNight = (b.business_date === todayStr && b.shift_period === 'NightShift');
+      var closeTime = isSameDayNight ? '12:00:00' : '23:59:59';
+
+      var result = db.endBreakAuto(b, closeTime);
       if (result) {
-        console.log(ts + ' [ArchiveWorker] ✓ Auto-closed #' + b.id + ' ' + b.user_name + ' (' + b.break_type + ' ' + b.start_time + ') → ' + result.curHMS + ' ' + (result.remark || ''));
+        console.log(ts + ' [ArchiveWorker] ✓ Auto-closed #' + b.id + ' ' + b.user_name + ' (' + b.break_type + ' ' + b.start_time + ' → ' + closeTime + ') ' + result.curHMS + ' ' + (result.remark || ''));
+
+        // For same-day NightShift breaks, also update the GS row to RETURNED
+        if (isSameDayNight && b.google_sheet_row > 0) {
+          try {
+            var statusText = result.remark ? ('⚠️ ' + result.remark) : '🟢 RETURNED';
+            await breakUpdateRange(ssId, 'CS BREAK!G' + b.google_sheet_row + ':J' + b.google_sheet_row, [[
+              closeTime, result.curHMS, result.remHMS, result.remark || ''
+            ]]);
+            await breakUpdateRange(ssId, 'CS BREAK!L' + b.google_sheet_row + ':M' + b.google_sheet_row, [[
+              result.totalHMS, statusText
+            ]]);
+            await breakUpdateRange(ssId, 'CS BREAK!O' + b.google_sheet_row, [[statusText]]);
+            console.log(ts + ' [ArchiveWorker] ✓ GS row ' + b.google_sheet_row + ' updated to RETURNED');
+          } catch (gsErr) {
+            console.warn(ts + ' [ArchiveWorker] GS update failed for #' + b.id + ' row ' + b.google_sheet_row + ': ' + gsErr.message);
+          }
+        }
       }
     } catch (err) {
       console.warn(ts + ' [ArchiveWorker] Auto-close failed for #' + b.id + ': ' + err.message);
     }
   }
 
-  autoCloseToday = todayStr;
   console.log(ts + ' [ArchiveWorker] Auto-close complete. Closed ' + staleBreaks.length + ' stale break(s).');
 }
 

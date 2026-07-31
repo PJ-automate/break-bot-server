@@ -94,6 +94,37 @@ async function syncEndBreak(item) {
 }
 
 // ============================================================
+//  TRACK OVERBREAK VIOLATION — Write to OVERBREAK_TRACKER sheet
+//  Called after an end sync when remark is OVERBREAK or LONG BREAK
+// ============================================================
+
+async function trackOverbreakViolation(item) {
+  try {
+    await getOrCreateSheet(SH, 'OVERBREAK_TRACKER');
+
+    var now = new Date();
+    var dateStr = formatDate(now, 'yyyy-MM-dd HH:mm:ss');
+    var startEnd = (item.start_time || '') + ' → ' + (item.end_time || '');
+    var violationLabel = item.remark === 'OVERBREAK' ? 'OVERBREAK' : 'LONG BREAK';
+
+    await breakAppendRow(SH, 'OVERBREAK_TRACKER!A:I', [
+      dateStr,
+      item.user_name || '',
+      item.user_id || '',
+      item.shift_type || '',
+      item.shift_period || '',
+      (item.break_type || '') + ' (' + violationLabel + ')',
+      startEnd,
+      item.duration_hms || '',
+      item.total_used_hms || ''
+    ]);
+    console.log('[SyncWorker] Violation tracked to OVERBREAK_TRACKER: ' + violationLabel + ' for ' + item.user_name);
+  } catch (err) {
+    console.warn('[SyncWorker] trackOverbreakViolation failed:', err.message);
+  }
+}
+
+// ============================================================
 //  SYNC BREAK RECORD — Bridge between break record and GS write
 //  Called inline from break-bot.js after SQLite commit.
 //  Manages sync_status: pending → syncing → synced / failed
@@ -158,6 +189,13 @@ async function syncBreakRecord(breakRecord) {
       console.log('[SyncWorker] Synced start #' + breakRecord.break_id + ' at row ' + logRow);
     } else {
       console.log('[SyncWorker] Synced end #' + breakRecord.break_id + ' at row ' + logRow);
+
+      // Track OVERBREAK / LONG BREAK violation to OVERBREAK_TRACKER
+      if (item.remark === 'OVERBREAK' || item.remark === 'LONG BREAK') {
+        trackOverbreakViolation(item).catch(function(err) {
+          console.warn('[SyncWorker] Overbreak tracking error (non-blocking):', err.message);
+        });
+      }
     }
     return true;
 
@@ -243,6 +281,13 @@ async function retryFailedSyncs() {
         db.getDB().prepare("UPDATE breaks SET sync_status = 'synced' WHERE id = ?").run(b.id);
       }
       console.log('[SyncWorker] Retry success #' + b.break_id + ' row=' + (item.google_sheet_row || '?'));
+
+      // Track OVERBREAK / LONG BREAK violation to OVERBREAK_TRACKER
+      if (item.remark === 'OVERBREAK' || item.remark === 'LONG BREAK') {
+        trackOverbreakViolation(item).catch(function(err) {
+          console.warn('[SyncWorker] Overbreak tracking error (non-blocking):', err.message);
+        });
+      }
 
     } catch (err) {
       db.getDB().prepare("UPDATE breaks SET sync_status = 'failed' WHERE id = ?").run(b.id);

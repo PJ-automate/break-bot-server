@@ -125,6 +125,37 @@ async function trackOverbreakViolation(item) {
 }
 
 // ============================================================
+//  FIRE-AND-FORGET DAILY SUMMARY UPDATE
+//  Restores behavior dropped during the sync rewrite (2026-07-30):
+//  updateDailySummary had no live caller, so the DAILY SUMMARY sheet
+//  stopped receiving new data. Called after a successful END-break sync.
+//  Deferred via setTimeout so it never blocks the CS BREAK sync.
+// ============================================================
+
+function fireDailySummary(item) {
+  setTimeout(function() {
+    try {
+      var ds = require('./break-bot');
+      if (typeof ds.updateDailySummary === 'function') {
+        var dsDate = item.business_date || '';
+        var dsUser = item.user_name || '';
+        var dsShift = item.shift_type || '';
+        var dsPeriod = item.shift_period || '';
+        var dsTotal = item.total_used_hms || '';
+        var dsRem = item.remaining || '';
+        if (dsDate && dsUser) {
+          ds.updateDailySummary(dsDate, dsUser, dsShift, dsPeriod, dsTotal, dsRem)
+            .then(function() { console.log('[SyncWorker] Daily summary updated for ' + dsUser + ' ' + dsDate); })
+            .catch(function(e) { console.warn('[SyncWorker] Daily summary update error (non-blocking):', e.message); });
+        }
+      }
+    } catch (e) {
+      console.warn('[SyncWorker] Daily summary fire error:', e.message);
+    }
+  }, 0);
+}
+
+// ============================================================
 //  SYNC BREAK RECORD — Bridge between break record and GS write
 //  Called inline from break-bot.js after SQLite commit.
 //  Manages sync_status: pending → syncing → synced / failed
@@ -196,6 +227,9 @@ async function syncBreakRecord(breakRecord) {
           console.warn('[SyncWorker] Overbreak tracking error (non-blocking):', err.message);
         });
       }
+
+      // Fire-and-forget DAILY SUMMARY update (restores pre-rewrite behavior)
+      fireDailySummary(item);
     }
     return true;
 
@@ -288,6 +322,9 @@ async function retryFailedSyncs() {
           console.warn('[SyncWorker] Overbreak tracking error (non-blocking):', err.message);
         });
       }
+
+      // Fire-and-forget DAILY SUMMARY update (restores pre-rewrite behavior)
+      if (b.status === 'ENDED' && b.end_time) fireDailySummary(item);
 
     } catch (err) {
       db.getDB().prepare("UPDATE breaks SET sync_status = 'failed' WHERE id = ?").run(b.id);

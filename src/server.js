@@ -114,14 +114,23 @@ async function start() {
   // Initialize SQLite database
   db.initDB();
 
-  // Import existing data from Google Sheet (one-time migration)
+  // Import existing data from Google Sheet (one-time migration).
+  // initBreakAuth MUST always run — the sync/archive workers need the client.
+  // The full-sheet read is a one-time migration; on a normal restart the DB
+  // already has data, so skip it (it used to hit the 90s Google timeout on
+  // every PM2 restart for nothing).
   try {
     await initBreakAuth();
-    console.log('[Startup] Importing break records from Google Sheet...');
-    const data = await readRange(CONFIG.breakSheetId, 'CS BREAK!A:O');
-    if (data && data.length > 1) {
-      var imported = db.importFromSheetData(data);
-      console.log('[Startup] Imported ' + imported + ' break records from Google Sheet');
+    var existingCount = db.getDB().prepare('SELECT COUNT(*) c FROM breaks').get();
+    if (existingCount && existingCount.c > 0) {
+      console.log('[Startup] Database already has ' + existingCount.c + ' breaks — skipping sheet import read');
+    } else {
+      console.log('[Startup] Importing break records from Google Sheet...');
+      const data = await readRange(CONFIG.breakSheetId, 'CS BREAK!A:O');
+      if (data && data.length > 1) {
+        var imported = db.importFromSheetData(data);
+        console.log('[Startup] Imported ' + imported + ' break records from Google Sheet');
+      }
     }
   } catch (err) {
     console.error('[Startup] Sheet import error (non-fatal):', err.message);

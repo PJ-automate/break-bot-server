@@ -506,15 +506,41 @@ async function deleteExcessRows(ssId, sheetName, keepCount) {
 }
 
 /**
+ * Cheap gate: read only column A (dates) and report whether any row is older
+ * than the cutoff. Lets cleanup skip its expensive full-sheet read when there
+ * is nothing to clean (the common case — these sheets only hold ~30 days).
+ * On gate-read failure, return true so the full read still runs (today's behavior).
+ */
+async function hasRowsOlderThan(ssId, sheetName, cutoffDate) {
+  try {
+    const data = await readRange(ssId, "'" + sheetName + "'!A:A");
+    if (!data || data.length < 2) return false;
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      if (!row || !row[0]) continue;
+      const d = cellToDateStr(row[0]);
+      if (d && d < cutoffDate) return true;
+    }
+    return false;
+  } catch (e) {
+    console.warn('[ArchiveWorker] Cleanup gate read failed for ' + sheetName + ': ' + e.message + ' — proceeding with full read');
+    return true;
+  }
+}
+
+/**
  * Clean up DAILY SUMMARY — keep only last 30 days of data.
  * Deletes rows where date is older than 30 days from today (PH time).
  */
 async function cleanupDailySummary(ssId) {
   try {
+    const cutoffDate = getDateDaysAgo(30);
+    // Gate: skip the full A:E read when nothing is older than 30 days
+    if (!(await hasRowsOlderThan(ssId, 'DAILY SUMMARY', cutoffDate))) {
+      return 0;
+    }
     const data = await readRange(ssId, 'DAILY SUMMARY!A:E');
     if (!data || data.length < 2) return 0;
-
-    const cutoffDate = getDateDaysAgo(30);
     const header = data[0];
     const rowsToKeep = [header];
     let deletedCount = 0;
@@ -552,10 +578,13 @@ async function cleanupDailySummary(ssId) {
  */
 async function cleanupArchives(ssId) {
   try {
+    const cutoffDate = getDateDaysAgo(30);
+    // Gate: skip the full A:O read (17k+ rows) when nothing is older than 30 days
+    if (!(await hasRowsOlderThan(ssId, 'Archives', cutoffDate))) {
+      return 0;
+    }
     const data = await readRange(ssId, "'Archives'!A:O");
     if (!data || data.length < 2) return 0;
-
-    const cutoffDate = getDateDaysAgo(30);
     const header = data[0];
     const rowsToKeep = [header];
     let deletedCount = 0;
@@ -726,22 +755,28 @@ async function reconcileActiveBreaks() {
   var activeBreaks = db.getAllActiveBreaks();
   if (!activeBreaks || activeBreaks.length === 0) return;
 
-  // Read current CS BREAK sheet data (only need columns M, G, H, I, J, L, N)
+  // Read ONLY the columns we need (G..N) instead of A:O — G=end, H=dur,
+  // I=rem, J=remark, L=total, M=status, N=break_id. Roughly halves the payload
+  // and avoids the recurring 90s timeout on this every-15-min read.
+  // Each returned row is 8 cells: [G,H,I,J,K,L,M,N] = index [0..7].
   var data;
   try {
-    data = await withTimeout(readRange(CONFIG.breakSheetId, 'CS BREAK!A:O'), 180000);
+    data = await withTimeout(readRange(CONFIG.breakSheetId, 'CS BREAK!G1:N1000'), 180000);
   } catch (e) {
     console.warn(ts + ' [ArchiveWorker] Reconcile read error: ' + e.message);
     return;
   }
   if (!data || data.length < 2) return;
 
+  // Column map for G..N (header row is row 1 = data[0], same as before)
+  var C_END = 0, C_DUR = 1, C_REM = 2, C_REMARK = 3, C_TOTAL = 5, C_STATUS = 6, C_BREAKID = 7;
+
   // Build break_id → sheet row map
   var sheetMap = {};
   for (var i = 1; i < data.length; i++) {
     var row = data[i];
-    if (row && row[13]) {
-      sheetMap[String(row[13]).trim()] = { sheetRow: i + 1, data: row };
+    if (row && row[C_BREAKID]) {
+      sheetMap[String(row[C_BREAKID]).trim()] = { sheetRow: i + 1, data: row };
     }
   }
 
@@ -751,14 +786,14 @@ async function reconcileActiveBreaks() {
     var match = sheetMap[br.break_id];
     if (!match) continue;
 
-    var sheetStatus = String(match.data[12] || '').trim();
+    var sheetStatus = String(match.data[C_STATUS] || '').trim();
     // Sheet shows ended but SQLite says active → reconcile
     if (sheetStatus.indexOf('RETURNED') >= 0 || sheetStatus.indexOf('OVERBREAK') >= 0 || sheetStatus.indexOf('LONG BREAK') >= 0) {
-      var endTime = String(match.data[6] || '').trim();
-      var durationHMS = String(match.data[7] || '').trim();
-      var remaining = String(match.data[8] || '').trim();
-      var remark = String(match.data[9] || '').trim();
-      var totalUsed = String(match.data[11] || '').trim();
+      var endTime = String(match.data[C_END] || '').trim();
+      var durationHMS = String(match.data[C_DUR] || '').trim();
+      var remaining = String(match.data[C_REM] || '').trim();
+      var remark = String(match.data[C_REMARK] || '').trim();
+      var totalUsed = String(match.data[C_TOTAL] || '').trim();
       var sheetRow = match.sheetRow;
 
       // Parse duration_hms ("0:02:05" or "00:02:05") to seconds

@@ -261,6 +261,20 @@ function getTodayHistory(userId, shiftPeriod) {
 }
 
 /**
+ * Get recent completed breaks across dates (for dashboard timeline).
+ * Sorted newest first, limited to N entries.
+ */
+function getRecentHistory(limit) {
+  const d = getDB();
+  return d.prepare(`
+    SELECT * FROM breaks
+    WHERE status = 'ENDED' AND duration_secs > 0
+    ORDER BY start_time DESC
+    LIMIT ?
+  `).all(limit || 50);
+}
+
+/**
  * Queue a sync operation for Google Sheets.
  */
 function queueSync(operation, breakId, payload) {
@@ -619,6 +633,6 @@ module.exports = {
   getAllActiveBreaks, importFromSheetData,
   getSummaryCache, setSummaryCache, getSummaryCacheByDate,
   clearSummaryCache, importSummaryCacheFromSheet,
-  getSetting, setSetting,
+  getSetting, setSetting, getRecentHistory,
   endBreakAuto, updateSheetRow, getStaleActiveBreaks, getStaleActiveBreaksForShift
 };

@@ -1306,17 +1306,28 @@ async function getDashboardData() {
     var dailyMap = {};
 
     try {
+      // Break history: recent 50 completed breaks, newest first (crosses date boundary)
+      var recentBreaks = db.getRecentHistory(50);
+      if (recentBreaks && recentBreaks.length > 0) {
+        for (var j = 0; j < recentBreaks.length; j++) {
+          var rb = recentBreaks[j];
+          if (!isSilentUser(rb.user_id)) {
+            breakHistory.push({
+              userName: rb.user_name, type: rb.break_type,
+              start: rb.start_time, end: rb.end_time,
+              duration: rb.duration_hms, remark: rb.remark || ''
+            });
+          }
+        }
+      }
+
+      // Daily summary & violations: use today's data
       var allBreaks = db.getTodayHistory('__ALL__');
       if (allBreaks && allBreaks.length > 0) {
         for (var i = 0; i < allBreaks.length; i++) {
           var b = allBreaks[i];
           if (b.status === 'ENDED' && b.duration_secs > 0 && !isSilentUser(b.user_id)) {
             var remark = b.remark || '';
-            breakHistory.push({
-              userName: b.user_name, type: b.break_type,
-              start: b.start_time, end: b.end_time,
-              duration: b.duration_hms, remark: remark
-            });
             if (remark === 'OVERBREAK' || remark === 'LONG BREAK') {
               var eIdx = seenViolationUsers[b.user_name];
               if (eIdx === undefined) {

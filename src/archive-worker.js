@@ -755,28 +755,43 @@ async function reconcileActiveBreaks() {
   var activeBreaks = db.getAllActiveBreaks();
   if (!activeBreaks || activeBreaks.length === 0) return;
 
-  // Read ONLY the columns we need (G..N) instead of A:O — G=end, H=dur,
-  // I=rem, J=remark, L=total, M=status, N=break_id. Roughly halves the payload
-  // and avoids the recurring 90s timeout on this every-15-min read.
+  // Compute the min/max sheet rows among active breaks so we read only
+  // the needed slice instead of 1000 rows from row 1 (which times out
+  // from OVH France every 15 min).  August 2026.
+  var minRow = 999999, maxRow = 0;
+  for (var r = 0; r < activeBreaks.length; r++) {
+    var sr = activeBreaks[r].google_sheet_row;
+    if (sr > 0) {
+      if (sr < minRow) minRow = sr;
+      if (sr > maxRow) maxRow = sr;
+    }
+  }
+  // No active break has a sheet row yet — nothing to reconcile
+  if (minRow > maxRow) return;
+
+  // Read ONLY the columns we need (G..N) — G=end, H=dur,
+  // I=rem, J=remark, L=total, M=status, N=break_id.
   // Each returned row is 8 cells: [G,H,I,J,K,L,M,N] = index [0..7].
+  var range = 'CS BREAK!G' + minRow + ':N' + maxRow;
   var data;
   try {
-    data = await withTimeout(readRange(CONFIG.breakSheetId, 'CS BREAK!G1:N1000'), 180000);
+    data = await withTimeout(readRange(CONFIG.breakSheetId, range), 180000);
   } catch (e) {
     console.warn(ts + ' [ArchiveWorker] Reconcile read error: ' + e.message);
     return;
   }
-  if (!data || data.length < 2) return;
+  if (!data || data.length < 1) return;
 
-  // Column map for G..N (header row is row 1 = data[0], same as before)
+  // data[0] is row minRow (no header row in the slice).
+  // Column map for G..N
   var C_END = 0, C_DUR = 1, C_REM = 2, C_REMARK = 3, C_TOTAL = 5, C_STATUS = 6, C_BREAKID = 7;
 
   // Build break_id → sheet row map
   var sheetMap = {};
-  for (var i = 1; i < data.length; i++) {
+  for (var i = 0; i < data.length; i++) {
     var row = data[i];
     if (row && row[C_BREAKID]) {
-      sheetMap[String(row[C_BREAKID]).trim()] = { sheetRow: i + 1, data: row };
+      sheetMap[String(row[C_BREAKID]).trim()] = { sheetRow: minRow + i, data: row };
     }
   }
 

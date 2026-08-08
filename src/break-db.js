@@ -269,7 +269,7 @@ function getRecentHistory(limit) {
   return d.prepare(`
     SELECT * FROM breaks
     WHERE status = 'ENDED' AND duration_secs > 0
-    ORDER BY start_time DESC
+    ORDER BY business_date DESC, start_time DESC
     LIMIT ?
   `).all(limit || 50);
 }
